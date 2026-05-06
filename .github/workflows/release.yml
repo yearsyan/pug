@@ -1,0 +1,90 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            asset: pug-linux
+          - name: macos
+            os: macos-latest
+            asset: pug-macos
+          - name: windows
+            os: windows-latest
+            asset: pug-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.asset }}"
+          cp target/release/pug "dist/${{ matrix.asset }}/pug"
+          cp README.md "dist/${{ matrix.asset }}/README.md"
+          tar -C dist -czf "dist/${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.asset }}" | Out-Null
+          Copy-Item "target/release/pug.exe" "dist/${{ matrix.asset }}/pug.exe"
+          Copy-Item "README.md" "dist/${{ matrix.asset }}/README.md"
+          Compress-Archive -Path "dist/${{ matrix.asset }}" -DestinationPath "dist/${{ matrix.asset }}.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: pug ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+          fail_on_unmatched_files: true
