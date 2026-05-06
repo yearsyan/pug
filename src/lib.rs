@@ -48,7 +48,7 @@ enum EngineCommands {
     Current,
     Which(EngineWhichArgs),
     Start(EngineStartArgs),
-    Uninstall(EngineUseArgs),
+    Uninstall(EngineTagArgs),
 }
 
 #[derive(Args, Debug)]
@@ -86,6 +86,11 @@ struct EngineInstallArgs {
 
 #[derive(Args, Debug)]
 struct EngineUseArgs {
+    tag: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct EngineTagArgs {
     tag: String,
 }
 
@@ -187,7 +192,7 @@ pub fn run() -> Result<()> {
             }),
             EngineCommands::List(args) => engine::list(args.remote),
             EngineCommands::Install(args) => engine::install(args.tag, args.download_only),
-            EngineCommands::Use(args) => engine::use_tag(&args.tag),
+            EngineCommands::Use(args) => engine::use_tag(args.tag.as_deref()),
             EngineCommands::Current => engine::current(),
             EngineCommands::Which(args) => {
                 let path = engine::resolve_editor(args.with_engine.as_deref())?;

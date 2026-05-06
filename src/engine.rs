@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, anyhow, bail};
+use inquire::Select;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -106,14 +108,12 @@ pub fn build(opts: EngineBuildOptions) -> Result<()> {
 pub fn list(remote_only: bool) -> Result<()> {
     let cfg = Config::load()?;
     if !remote_only {
-        let install_dir = cfg.install_dir()?;
-        if install_dir.is_dir() {
+        let local = installed_engine_tags(&cfg)?;
+        if !local.is_empty() {
             println!("local:");
-            for entry in fs::read_dir(&install_dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    println!("  {}", entry.file_name().to_string_lossy());
-                }
+            for tag in local {
+                let marker = if cfg.engine.current == tag { "*" } else { " " };
+                println!("{marker} {tag}");
             }
         }
     }
@@ -121,8 +121,9 @@ pub fn list(remote_only: bool) -> Result<()> {
     let tags = api.engine_tags()?;
     println!("remote:");
     for tag in tags.tags {
+        let marker = if cfg.engine.current == tag.tag { "*" } else { " " };
         println!(
-            "  {}  godot={} short={} repo={} engine={}",
+            "{marker} {}  godot={} short={} repo={} engine={}",
             tag.tag, tag.godot_version, tag.godot_version_short, tag.repo_commit, tag.engine_commit
         );
     }
@@ -166,15 +167,19 @@ pub fn install(tag: Option<String>, download_only: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn use_tag(tag: &str) -> Result<()> {
+pub fn use_tag(tag: Option<&str>) -> Result<()> {
     let mut cfg = Config::load()?;
-    let install_dir = cfg.install_dir()?.join(tag);
+    let tag = match tag {
+        Some(tag) => tag.to_string(),
+        None => choose_installed_engine_tag(&cfg)?,
+    };
+    let install_dir = cfg.install_dir()?.join(&tag);
     if !install_dir.is_dir() {
         bail!("engine tag is not installed locally: {tag}");
     }
-    cfg.engine.current = tag.to_string();
+    cfg.engine.current = tag;
     cfg.save()?;
-    println!("{tag}");
+    println!("{}", cfg.engine.current);
     Ok(())
 }
 
@@ -195,6 +200,43 @@ pub fn uninstall(tag: &str) -> Result<()> {
     }
     println!("removed {}", dir.display());
     Ok(())
+}
+
+fn installed_engine_tags(cfg: &Config) -> Result<Vec<String>> {
+    let install_dir = cfg.install_dir()?;
+    if !install_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut tags = Vec::new();
+    for entry in fs::read_dir(&install_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            tags.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    tags.sort();
+    Ok(tags)
+}
+
+fn choose_installed_engine_tag(cfg: &Config) -> Result<String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        bail!("engine tag is required when not running in an interactive terminal");
+    }
+
+    let tags = installed_engine_tags(cfg)?;
+    if tags.is_empty() {
+        bail!("no local engines installed; run `pug engine install <tag>` first");
+    }
+
+    let start = tags
+        .iter()
+        .position(|tag| tag == &cfg.engine.current)
+        .unwrap_or(0);
+    Select::new("Select engine", tags)
+        .with_starting_cursor(start)
+        .prompt()
+        .map_err(Into::into)
 }
 
 pub fn start(with_engine: Option<&Path>, project: Option<&Path>, args: &[String]) -> Result<()> {
