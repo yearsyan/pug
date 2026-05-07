@@ -490,7 +490,14 @@ fn run_scons(
             if enabled { "yes" } else { "no" }
         ));
     }
-    if let Some(key) = ctx.project.encryption.as_ref().and_then(|e| e.key.as_ref()) {
+    if let Some(key) = ctx
+        .project
+        .encryption
+        .as_ref()
+        .and_then(|e| e.key.as_deref())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
         cmd.env("SCRIPT_AES256_ENCRYPTION_KEY", key);
     }
     cmd.args(&ctx.scons_args)
