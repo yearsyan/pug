@@ -107,6 +107,7 @@ pub fn build(opts: EngineBuildOptions) -> Result<()> {
 
 pub fn list(remote_only: bool) -> Result<()> {
     let cfg = Config::load()?;
+    let project_name = resolve_project_name()?;
     if !remote_only {
         let local = installed_engine_tags(&cfg)?;
         if !local.is_empty() {
@@ -118,7 +119,7 @@ pub fn list(remote_only: bool) -> Result<()> {
         }
     }
     let api = ApiClient::from_config(&cfg)?;
-    let tags = api.engine_tags()?;
+    let tags = api.engine_tags_for_project(&project_name)?;
     println!("remote:");
     for tag in tags.tags {
         let marker = if cfg.engine.current == tag.tag { "*" } else { " " };
@@ -132,12 +133,13 @@ pub fn list(remote_only: bool) -> Result<()> {
 
 pub fn install(tag: Option<String>, download_only: bool) -> Result<()> {
     let cfg = Config::load()?;
+    let project_name = resolve_project_name()?;
     let tag = tag
         .or_else(|| read_project_engine_tag().ok().flatten())
         .or_else(|| (!cfg.engine.current.is_empty()).then(|| cfg.engine.current.clone()))
         .context("no engine tag specified and no project/config current tag found")?;
     let api = ApiClient::from_config(&cfg)?;
-    let response = api.engine_download(&tag)?;
+    let response = api.engine_download(&project_name, &tag)?;
     let target = choose_editor_artifact(&response.artifacts)?;
     let tmp = tempfile::tempdir()?;
     let zip = tmp.path().join("engine.zip");
@@ -636,6 +638,26 @@ fn read_project_engine_tag() -> Result<Option<String>> {
         .and_then(|e| e.get("tag"))
         .and_then(Value::as_str)
         .map(str::to_string))
+}
+
+pub(crate) fn resolve_project_name() -> Result<String> {
+    if let Ok(name) = std::env::var("PANNEL_PROJECT_NAME")
+        && !name.trim().is_empty()
+    {
+        return Ok(name.trim().to_string());
+    }
+    let cwd = std::env::current_dir()?;
+    for candidate in [cwd.join("project.json"), cwd.join("project.pug.json")] {
+        if candidate.is_file() {
+            let value: Value = serde_json::from_slice(&fs::read(&candidate)?)?;
+            if let Some(name) = value.get("name").and_then(Value::as_str)
+                && !name.trim().is_empty()
+            {
+                return Ok(name.trim().to_string());
+            }
+        }
+    }
+    bail!("project name is required; set project.json name or PANNEL_PROJECT_NAME")
 }
 
 fn existing_file(path: &Path) -> Result<PathBuf> {

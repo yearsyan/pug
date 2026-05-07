@@ -18,6 +18,8 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectConfig {
+    #[serde(default)]
+    name: String,
     version: u32,
     engine: ProjectEngine,
     platforms: Vec<String>,
@@ -60,7 +62,8 @@ pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()>
         Some(tag) => tag,
         None if !cfg.engine.current.is_empty() => cfg.engine.current.clone(),
         None => {
-            let tags = api.engine_tags()?;
+            let project_name = engine::resolve_project_name()?;
+            let tags = api.engine_tags_for_project(&project_name)?;
             tags.tags
                 .first()
                 .map(|t| t.tag.clone())
@@ -71,6 +74,7 @@ pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()>
         .map(|p| platform::parse_platform_list(&p))
         .unwrap_or_else(|| vec![platform::host_platform().unwrap_or("macos").to_string()]);
     let project = ProjectConfig {
+        name: engine::resolve_project_name().unwrap_or_default(),
         version: 1,
         engine: ProjectEngine { tag },
         platforms,
@@ -106,8 +110,13 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     let (name, requested_version) = parse_package(package)?;
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
+    let project_name = if project.name.trim().is_empty() {
+        engine::resolve_project_name()?
+    } else {
+        project.name.clone()
+    };
     let project_engine_commit = api
-        .engine_tags()?
+        .engine_tags_for_project(&project_name)?
         .tags
         .into_iter()
         .find(|tag| tag.tag == project.engine.tag)
@@ -119,6 +128,7 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
         for arch in platform::default_arches(platform_name)? {
             let target = platform::spec(platform_name, arch)?;
             let resolved = api.resolve_extension(
+                &project_name,
                 &name,
                 requested_version.as_deref(),
                 &target.platform,
@@ -494,7 +504,12 @@ fn download_export_templates(
 ) -> Result<ExportTemplates> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
-    let response = api.engine_download(&project.engine.tag)?;
+    let project_name = if project.name.trim().is_empty() {
+        engine::resolve_project_name()?
+    } else {
+        project.name.clone()
+    };
+    let response = api.engine_download(&project_name, &project.engine.tag)?;
     let cache_root = cwd
         .join(".godot")
         .join("pug")
@@ -1061,6 +1076,7 @@ mod tests {
         extensions.insert("rust_demo".to_string(), "0.2.0".to_string());
         extensions.insert("netcode".to_string(), "1.0.0".to_string());
         let project = ProjectConfig {
+            name: "test_project".to_string(),
             version: 1,
             engine: ProjectEngine {
                 tag: "test".to_string(),
@@ -1109,6 +1125,7 @@ mod tests {
         fs::write(lib_dir.join("rust_demo.dll"), "demo dll").unwrap();
 
         let project = ProjectConfig {
+            name: "test_project".to_string(),
             version: 1,
             engine: ProjectEngine {
                 tag: "test".to_string(),

@@ -136,10 +136,15 @@ pub(super) fn upload_engine_artifacts(
 ) -> Result<()> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
+    let project_name = ctx
+        .project
+        .name
+        .as_deref()
+        .context("project.json missing name; pannel uploads are project-scoped")?;
     let repo_commit = git_head(&ctx.repo_root)?;
     let engine_commit = git_head(&ctx.godot_src)?;
     let (godot_version, godot_version_short) = godot_version(&ctx.godot_src)?;
-    let existing = existing_engine_artifacts(&api, &repo_commit, &engine_commit)?;
+    let existing = existing_engine_artifacts(&api, project_name, &repo_commit, &engine_commit)?;
     for artifact in artifacts {
         if let Some(remote) = existing
             .iter()
@@ -160,6 +165,7 @@ pub(super) fn upload_engine_artifacts(
             );
         }
         let init = api.engine_upload_init(&EngineUploadInit {
+            project_name,
             repo_commit: &repo_commit,
             engine_commit: &engine_commit,
             godot_version: &godot_version,
@@ -193,10 +199,11 @@ pub(super) fn upload_engine_artifacts(
 
 fn existing_engine_artifacts(
     api: &ApiClient,
+    project_name: &str,
     repo_commit: &str,
     engine_commit: &str,
 ) -> Result<Vec<RemoteEngineArtifact>> {
-    let tags = api.engine_tags()?;
+    let tags = api.engine_tags_for_project(project_name)?;
     let Some(tag) = tags
         .tags
         .into_iter()
@@ -204,7 +211,7 @@ fn existing_engine_artifacts(
     else {
         return Ok(Vec::new());
     };
-    Ok(api.engine_download(&tag.tag)?.artifacts)
+    Ok(api.engine_download(project_name, &tag.tag)?.artifacts)
 }
 
 fn same_engine_artifact_slot(remote: &RemoteEngineArtifact, local: &BuiltArtifact) -> bool {

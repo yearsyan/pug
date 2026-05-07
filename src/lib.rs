@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod create_project;
 mod engine;
 mod extension;
 mod platform;
@@ -32,6 +33,9 @@ enum Commands {
         command: ExtensionCommands,
     },
     Init(InitArgs),
+    #[command(about = "Create a new Godot custom overlay project")]
+    CreateProject(CreateProjectArgs),
+    Login,
     SetupToken(SetupTokenArgs),
     Project {
         #[command(subcommand)]
@@ -145,6 +149,23 @@ struct InitArgs {
 }
 
 #[derive(Args, Debug)]
+struct CreateProjectArgs {
+    #[arg(help = "Project name; prompts when omitted")]
+    name: Option<String>,
+    #[arg(
+        long,
+        help = "Git/HTTPS template repository to copy modules/ and patches/ from"
+    )]
+    template: Option<String>,
+    #[arg(long, requires = "template", conflicts_with_all = ["tag", "commit"], help = "Template branch to clone")]
+    branch: Option<String>,
+    #[arg(long, requires = "template", conflicts_with_all = ["branch", "commit"], help = "Template tag to clone")]
+    tag: Option<String>,
+    #[arg(long, requires = "template", conflicts_with_all = ["branch", "tag"], help = "Template commit to checkout")]
+    commit: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct SetupTokenArgs {
     token: Option<String>,
 }
@@ -217,6 +238,10 @@ pub fn run() -> Result<()> {
             ExtensionCommands::List(args) => extension::list(args.remote),
         },
         Commands::Init(args) => project::init(args.engine_tag, args.platforms),
+        Commands::CreateProject(args) => {
+            create_project::create(args.name, args.template, args.branch, args.tag, args.commit)
+        }
+        Commands::Login => config::login(),
         Commands::SetupToken(args) => config::setup_access_token(args.token),
         Commands::Project { command } => match command {
             ProjectCommands::Install(args) => project::install(args.package.as_deref()),

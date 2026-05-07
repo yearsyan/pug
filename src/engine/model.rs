@@ -7,6 +7,7 @@ use std::{
 
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub(crate) struct ProjectJson {
+    pub(crate) name: Option<String>,
     pub(crate) tag: Option<String>,
     pub(crate) godot: Option<GodotSection>,
     pub(crate) platforms: Option<Vec<String>>,

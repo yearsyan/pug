@@ -20,6 +20,7 @@ const ANDROID_API_LEVEL: &str = "21";
 
 #[derive(Debug, Deserialize)]
 struct ExtensionProjectJson {
+    name: Option<String>,
     platforms: Option<Vec<String>>,
 }
 
@@ -106,7 +107,8 @@ pub fn list(remote_only: bool) -> Result<()> {
     }
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
-    let response = api.extensions()?;
+    let project_name = engine::resolve_project_name()?;
+    let response = api.extensions(&project_name)?;
     println!("remote:");
     for item in response.extensions {
         println!(
@@ -533,6 +535,7 @@ fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
     let repo = engine::find_repo_root()?;
+    let project_name = project_name_from_repo(&repo)?;
     let godot_src = fs::read_to_string(repo.join(".repocache")).context("read .repocache")?;
     let godot_src = PathBuf::from(godot_src.trim());
     let repo_commit = engine::git_head(&repo)?;
@@ -540,6 +543,7 @@ fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
     let (godot_version, godot_version_short) = engine::godot_version(&godot_src)?;
     for item in items {
         let init = api.extension_upload_init(&ExtensionUploadInit {
+            project_name: &project_name,
             name: &item.name,
             version: &item.version,
             repo_commit: &repo_commit,
@@ -568,6 +572,24 @@ fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn project_name_from_repo(repo: &Path) -> Result<String> {
+    if let Ok(name) = std::env::var("PANNEL_PROJECT_NAME")
+        && !name.trim().is_empty()
+    {
+        return Ok(name.trim().to_string());
+    }
+    let path = repo.join("project.json");
+    let project: ExtensionProjectJson = serde_json::from_str(
+        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    project
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .context("project.json missing name; pannel uploads are project-scoped")
 }
 
 fn cargo_env_target(target: &str) -> String {

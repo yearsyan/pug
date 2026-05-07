@@ -13,14 +13,19 @@ pub struct ApiClient {
 }
 
 #[derive(Debug, Deserialize)]
-struct ErrorEnvelope {
-    error: ApiError,
+struct ApiEnvelope<T> {
+    data: T,
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiError {
-    code: String,
+struct ErrorEnvelope {
+    data: ApiErrorData,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorData {
+    error_code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,12 +50,24 @@ pub struct CompleteResponse {
 #[allow(dead_code)]
 pub struct AccessTokenValidateResponse {
     pub ok: bool,
-    pub access_token: AccessTokenInfo,
+    pub access_token: Option<AccessTokenInfo>,
+    pub cli_session: Option<CLISessionInfo>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct AccessTokenInfo {
+    pub id: u64,
+    pub project_id: Option<u64>,
+    pub created_by_user_id: Option<u64>,
+    pub name: String,
+    pub used_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct CLISessionInfo {
     pub id: u64,
     pub user_id: u64,
     pub name: String,
@@ -122,6 +139,7 @@ pub struct ExtensionResolveResponse {
 
 #[derive(Debug, Serialize)]
 pub struct EngineUploadInit<'a> {
+    pub project_name: &'a str,
     pub repo_commit: &'a str,
     pub engine_commit: &'a str,
     pub godot_version: &'a str,
@@ -140,6 +158,7 @@ pub struct EngineUploadInit<'a> {
 
 #[derive(Debug, Serialize)]
 pub struct ExtensionUploadInit<'a> {
+    pub project_name: &'a str,
     pub name: &'a str,
     pub version: &'a str,
     pub repo_commit: &'a str,
@@ -178,16 +197,16 @@ impl ApiClient {
     }
 
     pub fn validate_access_token(&self) -> Result<AccessTokenValidateResponse> {
-        self.authenticated_get_json("/api/v1/access-token/validate")
+        self.authenticated_get_json("/cli-api/v1/access-token/validate")
     }
 
     pub fn engine_upload_init(&self, req: &EngineUploadInit<'_>) -> Result<UploadInitResponse> {
-        self.authenticated_post_json("/api/v1/engines/upload/init", req)
+        self.authenticated_post_json("/cli-api/v1/engines/upload/init", req)
     }
 
     pub fn engine_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {
         self.authenticated_post_json(
-            "/api/v1/engines/upload/complete",
+            "/cli-api/v1/engines/upload/complete",
             &CompleteUpload { upload_id },
         )
     }
@@ -196,38 +215,50 @@ impl ApiClient {
         &self,
         req: &ExtensionUploadInit<'_>,
     ) -> Result<UploadInitResponse> {
-        self.authenticated_post_json("/api/v1/extensions/upload/init", req)
+        self.authenticated_post_json("/cli-api/v1/extensions/upload/init", req)
     }
 
     pub fn extension_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {
         self.authenticated_post_json(
-            "/api/v1/extensions/upload/complete",
+            "/cli-api/v1/extensions/upload/complete",
             &CompleteUpload { upload_id },
         )
     }
 
-    pub fn engine_tags(&self) -> Result<EngineTagsResponse> {
-        self.get_json("/api/v1/engines/tags")
+    pub fn engine_tags_for_project(&self, project: &str) -> Result<EngineTagsResponse> {
+        self.authenticated_get_json(&format!(
+            "/cli-api/v1/projects/{}/engines/tags",
+            url_escape(project)
+        ))
     }
 
-    pub fn engine_download(&self, tag: &str) -> Result<EngineDownloadResponse> {
-        self.get_json(&format!("/api/v1/engines/download/{tag}"))
+    pub fn engine_download(&self, project: &str, tag: &str) -> Result<EngineDownloadResponse> {
+        self.authenticated_get_json(&format!(
+            "/cli-api/v1/projects/{}/engines/download/{}",
+            url_escape(project),
+            url_escape(tag)
+        ))
     }
 
-    pub fn extensions(&self) -> Result<ExtensionsResponse> {
-        self.get_json("/api/v1/extensions")
+    pub fn extensions(&self, project: &str) -> Result<ExtensionsResponse> {
+        self.authenticated_get_json(&format!(
+            "/cli-api/v1/projects/{}/extensions",
+            url_escape(project)
+        ))
     }
 
     pub fn resolve_extension(
         &self,
+        project: &str,
         name: &str,
         version: Option<&str>,
         platform: &str,
         arch: &str,
     ) -> Result<ExtensionResolveResponse> {
         let version = version.unwrap_or("latest");
-        self.get_json(&format!(
-            "/api/v1/extensions/resolve?name={}&version={}&platform={}&arch={}",
+        self.authenticated_get_json(&format!(
+            "/cli-api/v1/projects/{}/extensions/resolve?name={}&version={}&platform={}&arch={}",
+            url_escape(project),
             url_escape(name),
             url_escape(version),
             url_escape(platform),
@@ -259,17 +290,9 @@ impl ApiClient {
         Ok(())
     }
 
-    fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let response = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .send()?;
-        parse_response(response)
-    }
-
     fn authenticated_get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let token = self.access_token.as_deref().context(
-            "access token is not configured; run `pug setup-token <token>` before uploading",
+            "authentication is not configured; run `pug login` or `pug setup-token <token>` before uploading",
         )?;
         let response = self
             .client
@@ -285,7 +308,7 @@ impl ApiClient {
         body: &B,
     ) -> Result<T> {
         let token = self.access_token.as_deref().context(
-            "access token is not configured; run `pug setup-token <token>` before uploading",
+            "authentication is not configured; run `pug login` or `pug setup-token <token>` before uploading",
         )?;
         let response = self
             .client
@@ -304,12 +327,13 @@ fn parse_response<T: for<'de> Deserialize<'de>>(
     let bytes = response.bytes()?;
     if !status.is_success() {
         if let Ok(envelope) = serde_json::from_slice::<ErrorEnvelope>(&bytes) {
-            bail!("{}: {}", envelope.error.code, envelope.error.message);
+            bail!("{}: {}", envelope.data.error_code, envelope.message);
         }
         bail!("HTTP {status}: {}", String::from_utf8_lossy(&bytes));
     }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("decode response: {}", String::from_utf8_lossy(&bytes)))
+    let envelope: ApiEnvelope<T> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode response: {}", String::from_utf8_lossy(&bytes)))?;
+    Ok(envelope.data)
 }
 
 fn url_escape(value: &str) -> String {
