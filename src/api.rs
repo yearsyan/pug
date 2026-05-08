@@ -32,7 +32,7 @@ struct ApiErrorData {
 #[allow(dead_code)]
 pub struct UploadInitResponse {
     pub upload_id: String,
-    pub engine_tag: String,
+    pub engine_tag: Option<String>,
     pub s3_key: String,
     pub upload_url: String,
     #[serde(default)]
@@ -42,7 +42,7 @@ pub struct UploadInitResponse {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct CompleteResponse {
-    pub engine_tag: String,
+    pub engine_tag: Option<String>,
     pub status: String,
 }
 
@@ -175,6 +175,36 @@ pub struct ExtensionUploadInit<'a> {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ExportUploadInit<'a> {
+    pub project_name: &'a str,
+    pub version: &'a str,
+    pub platform: &'a str,
+    pub mode: &'a str,
+    pub package_type: &'a str,
+    pub package_sha256: &'a str,
+    pub package_size: i64,
+    pub engine_tag: &'a str,
+    pub repo_commit: &'a str,
+    pub export_path: &'a str,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct EditorTokenResponse {
+    pub editor_token: String,
+    pub expires_at: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct ManifestPublicKeyResponse {
+    pub manifest_public_key_pem: String,
+    pub manifest_public_key_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
 struct CompleteUpload<'a> {
     upload_id: &'a str,
 }
@@ -221,6 +251,31 @@ impl ApiClient {
     pub fn extension_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {
         self.authenticated_post_json(
             "/cli-api/v1/extensions/upload/complete",
+            &CompleteUpload { upload_id },
+        )
+    }
+
+    pub fn editor_token(&self, project: &str) -> Result<EditorTokenResponse> {
+        self.authenticated_post_json(
+            &format!("/cli-api/v1/projects/{}/editor-token", url_escape(project)),
+            &serde_json::json!({}),
+        )
+    }
+
+    pub fn manifest_public_key(&self, project: &str) -> Result<ManifestPublicKeyResponse> {
+        self.authenticated_get_json(&format!(
+            "/cli-api/v1/projects/{}/manifest-public-key",
+            url_escape(project)
+        ))
+    }
+
+    pub fn export_upload_init(&self, req: &ExportUploadInit<'_>) -> Result<UploadInitResponse> {
+        self.authenticated_post_json("/cli-api/v1/exports/upload/init", req)
+    }
+
+    pub fn export_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {
+        self.authenticated_post_json(
+            "/cli-api/v1/exports/upload/complete",
             &CompleteUpload { upload_id },
         )
     }

@@ -13,6 +13,7 @@ pub(crate) struct ProjectJson {
     pub(crate) platforms: Option<Vec<String>>,
     pub(crate) modules: Option<ModulesSection>,
     pub(crate) encryption: Option<EncryptionSection>,
+    pub(crate) signing: Option<SigningSection>,
     pub(crate) android: Option<ArchSection>,
     pub(crate) ios: Option<ArchSection>,
     pub(crate) splash: Option<Value>,
@@ -39,6 +40,12 @@ pub(crate) struct EncryptionSection {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
+pub(crate) struct SigningSection {
+    pub(crate) enabled: Option<bool>,
+    pub(crate) manifest_public_key_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub(crate) struct ArchSection {
     pub(crate) archs: Option<Vec<String>>,
 }
@@ -53,6 +60,7 @@ pub(crate) struct BuildContext {
     pub(crate) host_arch: &'static str,
     pub(crate) template_targets: Vec<TemplateTarget>,
     pub(crate) scons_args: Vec<String>,
+    pub(crate) manifest_public_key_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

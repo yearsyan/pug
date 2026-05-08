@@ -1094,13 +1094,14 @@ dependencies = [
 
 [[package]]
 name = "pug"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",
  "dirs",
  "flate2",
  "inquire",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

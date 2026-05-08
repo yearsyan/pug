@@ -194,6 +194,10 @@ struct ProjectExportArgs {
     #[arg(long)]
     release: bool,
     #[arg(long)]
+    upload: bool,
+    #[arg(long)]
+    no_remote_sign: bool,
+    #[arg(long)]
     with_engine: Option<PathBuf>,
 }
 
@@ -252,6 +256,8 @@ pub fn run() -> Result<()> {
                     ios: args.ios,
                     debug: args.debug,
                     release: args.release,
+                    upload: args.upload,
+                    no_remote_sign: args.no_remote_sign,
                     with_engine: args.with_engine,
                 })
             }

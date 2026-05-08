@@ -189,7 +189,7 @@ pub(super) fn upload_engine_artifacts(
             artifact.platform,
             artifact.kind,
             artifact.arch,
-            complete.engine_tag,
+            complete.engine_tag.as_deref().unwrap_or(""),
             complete.status,
             init.s3_key
         );
@@ -303,6 +303,7 @@ mod tests {
             host_arch: "x86_64",
             template_targets: Vec::new(),
             scons_args: Vec::new(),
+            manifest_public_key_path: None,
         };
 
         let artifacts = package_engine_artifacts(&ctx).unwrap();
@@ -361,6 +362,7 @@ mod tests {
                 arch: "x86_64".to_string(),
             }],
             scons_args: Vec::new(),
+            manifest_public_key_path: None,
         };
 
         let artifacts = package_engine_artifacts(&ctx).unwrap();

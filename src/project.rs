@@ -1,28 +1,56 @@
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use rand::{Rng, distr::Alphanumeric};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
 };
+use walkdir::WalkDir;
 
 use crate::{
-    api::{ApiClient, EngineArtifact},
+    api::{ApiClient, EngineArtifact, ExportUploadInit},
     config::Config,
     engine,
     extension::PackageMetadata,
     platform, util,
 };
 
+fn default_project_version() -> String {
+    "0.1.0".to_string()
+}
+
+fn deserialize_project_version<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(version) => Ok(version),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Null => Ok(default_project_version()),
+        other => Err(serde::de::Error::custom(format!(
+            "project version must be a string, got {other}"
+        ))),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectConfig {
     #[serde(default)]
     name: String,
-    version: u32,
+    #[serde(
+        default = "default_project_version",
+        deserialize_with = "deserialize_project_version"
+    )]
+    version: String,
     engine: ProjectEngine,
-    platforms: Vec<String>,
+    #[serde(default)]
+    platforms: ProjectPlatforms,
     #[serde(default)]
     extensions: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,9 +62,264 @@ struct ProjectEngine {
     tag: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ProjectExportConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypt: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypt_pck: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encrypt_directory: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_include_filters: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_exclude_filters: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     script_encryption_key: Option<String>,
+    #[serde(default, skip_serializing)]
+    windows: Option<ProjectPlatformConfig>,
+    #[serde(default, skip_serializing)]
+    macos: Option<ProjectPlatformConfig>,
+    #[serde(default, skip_serializing)]
+    linux: Option<ProjectPlatformConfig>,
+    #[serde(default, skip_serializing)]
+    ios: Option<ProjectPlatformConfig>,
+    #[serde(default, skip_serializing)]
+    android: Option<ProjectPlatformConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectPlatforms(Vec<ProjectPlatformEntry>);
+
+#[derive(Debug, Clone)]
+struct ProjectPlatformEntry {
+    name: String,
+    config: ProjectPlatformConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectPlatformConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    export_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    architecture: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_pck: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    architectures: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_sdk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_sdk: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gradle_build_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    debug_keystore: Option<AndroidKeystoreConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_keystore: Option<AndroidKeystoreConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    internet_permission: Option<bool>,
+}
+
+impl ProjectPlatformConfig {
+    fn merge_missing(&mut self, other: ProjectPlatformConfig) {
+        macro_rules! fill {
+            ($field:ident) => {
+                if self.$field.is_none() {
+                    self.$field = other.$field;
+                }
+            };
+        }
+
+        fill!(export_path);
+        fill!(architecture);
+        fill!(bundle_identifier);
+        fill!(embed_pck);
+        fill!(name);
+        fill!(package);
+        fill!(signed);
+        fill!(architectures);
+        fill!(version_code);
+        fill!(version_name);
+        fill!(min_sdk);
+        fill!(target_sdk);
+        fill!(gradle_build_directory);
+        fill!(debug_keystore);
+        fill!(release_keystore);
+        fill!(internet_permission);
+    }
+}
+
+impl ProjectPlatforms {
+    fn from_specs<I, S>(specs: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut platforms = Self::default();
+        for spec in specs {
+            platforms
+                .push_spec(spec.as_ref())
+                .map_err(|err| anyhow::anyhow!(err))?;
+        }
+        Ok(platforms)
+    }
+
+    #[cfg(test)]
+    fn from_configs<I, S>(configs: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (S, ProjectPlatformConfig)>,
+        S: AsRef<str>,
+    {
+        let mut platforms = Self::default();
+        for (name, config) in configs {
+            platforms
+                .merge_config(name.as_ref(), config)
+                .map_err(|err| anyhow::anyhow!(err))?;
+        }
+        Ok(platforms)
+    }
+
+    fn push_spec(&mut self, raw: &str) -> std::result::Result<(), String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(());
+        }
+        let (platform_name, arch) = raw
+            .split_once(':')
+            .map(|(platform_name, arch)| (platform_name, Some(arch)))
+            .unwrap_or((raw, None));
+        let platform_name = normalize_project_platform_name(platform_name)?;
+        let mut config = ProjectPlatformConfig::default();
+        if let Some(arch) = arch.map(str::trim).filter(|arch| !arch.is_empty()) {
+            if platform_name == "android" {
+                config.architectures = Some(vec![arch.to_string()]);
+            } else {
+                config.architecture = Some(arch.to_string());
+            }
+        }
+        self.merge_config(&platform_name, config)
+    }
+
+    fn merge_config(
+        &mut self,
+        raw_name: &str,
+        config: ProjectPlatformConfig,
+    ) -> std::result::Result<(), String> {
+        let name = normalize_project_platform_name(raw_name)?;
+        if let Some(entry) = self.0.iter_mut().find(|entry| entry.name == name) {
+            entry.config.merge_missing(config);
+        } else {
+            self.0.push(ProjectPlatformEntry { name, config });
+        }
+        Ok(())
+    }
+
+    fn get(&self, platform_name: &str) -> Option<&ProjectPlatformConfig> {
+        self.0
+            .iter()
+            .find(|entry| entry.name == platform_name)
+            .map(|entry| &entry.config)
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.0.iter().map(|entry| entry.name.clone()).collect()
+    }
+}
+
+fn normalize_project_platform_name(raw_name: &str) -> std::result::Result<String, String> {
+    let name = platform::normalize_platform(raw_name.trim());
+    if name.is_empty() {
+        return Err("project.pug.json platforms contains an empty platform key".to_string());
+    }
+    Ok(name)
+}
+
+impl Serialize for ProjectPlatforms {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for entry in &self.0 {
+            map.serialize_entry(&entry.name, &entry.config)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectPlatforms {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProjectPlatformsVisitor;
+
+        impl<'de> de::Visitor<'de> for ProjectPlatformsVisitor {
+            type Value = ProjectPlatforms;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a platform config object or legacy platform string list")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut platforms = ProjectPlatforms::default();
+                while let Some(item) = seq.next_element::<String>()? {
+                    platforms.push_spec(&item).map_err(de::Error::custom)?;
+                }
+                Ok(platforms)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut platforms = ProjectPlatforms::default();
+                while let Some(name) = map.next_key::<String>()? {
+                    let config = map
+                        .next_value::<Option<ProjectPlatformConfig>>()?
+                        .unwrap_or_default();
+                    platforms
+                        .merge_config(&name, config)
+                        .map_err(de::Error::custom)?;
+                }
+                Ok(platforms)
+            }
+        }
+
+        deserializer.deserialize_any(ProjectPlatformsVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AndroidKeystoreConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_env: Option<String>,
 }
 
 pub struct ProjectExportOptions {
@@ -45,6 +328,8 @@ pub struct ProjectExportOptions {
     pub ios: bool,
     pub debug: bool,
     pub release: bool,
+    pub upload: bool,
+    pub no_remote_sign: bool,
     pub with_engine: Option<PathBuf>,
 }
 
@@ -73,9 +358,10 @@ pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()>
     let platforms = platforms
         .map(|p| platform::parse_platform_list(&p))
         .unwrap_or_else(|| vec![platform::host_platform().unwrap_or("macos").to_string()]);
+    let platforms = ProjectPlatforms::from_specs(platforms)?;
     let project = ProjectConfig {
         name: engine::resolve_project_name().unwrap_or_default(),
-        version: 1,
+        version: default_project_version(),
         engine: ProjectEngine { tag },
         platforms,
         extensions: BTreeMap::new(),
@@ -96,6 +382,7 @@ pub fn install(package: Option<&str>) -> Result<()> {
     let project = read_project(&cwd)?;
     let packages = locked_extension_packages(&project);
     if packages.is_empty() {
+        sync_export_presets(&cwd, &project, None)?;
         println!("no extensions listed in project.pug.json");
         return Ok(());
     }
@@ -124,9 +411,9 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     let mut installed_version = None;
     let mut template_text = None;
 
-    for platform_name in &project.platforms {
-        for arch in platform::default_arches(platform_name)? {
-            let target = platform::spec(platform_name, arch)?;
+    for platform_name in export_platforms(&project)? {
+        for arch in extension_arches_for_platform(&project, &platform_name)? {
+            let target = platform::spec(&platform_name, &arch)?;
             let resolved = api.resolve_extension(
                 &project_name,
                 &name,
@@ -231,6 +518,7 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     rewrite_manifest(&cwd, &name, &project, &template_text)?;
     update_extension_list(&cwd, &name)?;
     update_gitignore(&cwd)?;
+    sync_export_presets(&cwd, &project, None)?;
     println!("installed {package}");
     Ok(())
 }
@@ -246,68 +534,141 @@ fn locked_extension_packages(project: &ProjectConfig) -> Vec<String> {
 pub fn export_project(opts: ProjectExportOptions) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let project = read_project(&cwd)?;
-    let target_platform = resolve_export_platform(&opts)?;
+    let target_platforms = resolve_export_platforms(&opts)?;
     let mode = ExportMode::from_options(&opts)?;
 
+    for target_platform in target_platforms {
+        export_project_target(&cwd, &project, &opts, &target_platform, mode)?;
+    }
+    Ok(())
+}
+
+fn export_project_target(
+    cwd: &Path,
+    project: &ProjectConfig,
+    opts: &ProjectExportOptions,
+    target_platform: &str,
+    mode: ExportMode,
+) -> Result<()> {
     if target_platform == "ios" && platform::host_platform()? != "macos" {
         bail!("iOS export requires macOS");
     }
-    if target_platform != platform::host_platform()?
-        && target_platform != "android"
-        && target_platform != "ios"
+    if opts.upload && !matches!(target_platform, "android" | "windows") {
+        bail!("export artifact upload is currently supported for android and windows");
+    }
+    if !export_platforms(project)?
+        .iter()
+        .any(|platform_name| platform_name == target_platform)
     {
-        bail!("cross-platform export is only supported for Android and iOS");
+        bail!("project.pug.json platforms does not include export target {target_platform}");
     }
 
-    let preset = find_export_preset(&cwd, &target_platform)?;
     let editor = engine::resolve_editor(opts.with_engine.as_deref())?;
-    let templates = download_export_templates(&cwd, &project, &target_platform, mode)?;
+    let templates = if opts.with_engine.is_some() {
+        match local_export_templates(project, target_platform, mode) {
+            Ok(templates) => templates,
+            Err(err) => {
+                eprintln!("pug: local export templates unavailable ({err}); downloading templates");
+                download_export_templates(cwd, project, target_platform, mode)?
+            }
+        }
+    } else {
+        download_export_templates(cwd, project, target_platform, mode)?
+    };
+    let cfg = Config::load()?;
+    let api = ApiClient::from_config(&cfg)?;
+    let project_name = if project.name.trim().is_empty() {
+        engine::resolve_project_name()?
+    } else {
+        project.name.clone()
+    };
+    let remote_sign = if opts.no_remote_sign {
+        RemoteSignEnv::disabled()
+    } else {
+        let token = api
+            .editor_token(&project_name)
+            .with_context(|| format!("request editor signing token for project {project_name}"))?;
+        RemoteSignEnv::enabled(cfg.base_url(), project_name.clone(), token.editor_token)
+    };
 
-    let presets_path = cwd.join("export_presets.cfg");
-    let original_presets = fs::read_to_string(&presets_path)
-        .with_context(|| format!("read {}", presets_path.display()))?;
-    let mut next_presets = original_presets.clone();
-    if let Some(template) = &templates.custom_template {
-        next_presets = upsert_preset_option(
-            &next_presets,
-            preset.index,
-            mode.custom_template_key(),
-            &quoted_godot_path(template),
-        )?;
-    }
-    if let Some(android_source) = &templates.android_source_template {
-        next_presets = upsert_preset_option(
-            &next_presets,
-            preset.index,
-            "gradle_build/android_source_template",
-            &quoted_godot_path(android_source),
-        )?;
-    }
-    if preset_encryption_enabled(&original_presets, preset.index) {
-        let key = export_encryption_key(&project).with_context(|| {
-            "export preset enables encryption; set project.pug.json export.script_encryption_key or SCRIPT_AES256_ENCRYPTION_KEY"
+    let android_keystore =
+        prepare_android_keystore_override(cwd, project, target_platform, mode, &editor)?;
+    let template_override = ExportTemplateOverride {
+        platform: target_platform,
+        mode,
+        templates: &templates,
+        android_keystore: android_keystore.as_ref(),
+    };
+    let presets = sync_export_presets(cwd, project, Some(&template_override))?;
+    let target_preset_name = preset_platform_name(target_platform)?;
+    let preset = presets
+        .into_iter()
+        .find(|preset| preset.platform == target_preset_name)
+        .with_context(|| {
+            format!(
+                "project.pug.json platforms does not include export target {}",
+                target_platform
+            )
         })?;
-        write_export_credentials(&cwd, count_presets(&original_presets), &key)?;
+    if export_encryption_enabled(project) {
+        let key = export_encryption_key(project).with_context(|| {
+            "project.pug.json export enables encryption; set export.script_encryption_key or SCRIPT_AES256_ENCRYPTION_KEY"
+        })?;
+        write_export_credentials(cwd, preset_count(project)?, &key)?;
     }
 
-    if next_presets != original_presets {
-        fs::write(&presets_path, &next_presets)
-            .with_context(|| format!("write {}", presets_path.display()))?;
-    }
-
-    let export_result = run_godot_export(
+    run_godot_export(
         &editor,
-        &cwd,
+        cwd,
         &preset,
-        &target_platform,
+        target_platform,
         mode,
         templates.android_source_template.is_some(),
-    );
-    if next_presets != original_presets {
-        fs::write(&presets_path, &original_presets)
-            .with_context(|| format!("restore {}", presets_path.display()))?;
+        &remote_sign,
+    )?;
+
+    if opts.upload {
+        let export_path = resolve_export_path(cwd, &preset.export_path);
+        upload_export_artifact(
+            &api,
+            cwd,
+            project,
+            &project_name,
+            target_platform,
+            mode,
+            &export_path,
+            opts.no_remote_sign,
+        )?;
     }
-    export_result
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RemoteSignEnv {
+    base_url: Option<String>,
+    project_name: Option<String>,
+    editor_token: Option<String>,
+    no_remote_sign: bool,
+}
+
+impl RemoteSignEnv {
+    fn enabled(base_url: String, project_name: String, editor_token: String) -> Self {
+        Self {
+            base_url: Some(base_url),
+            project_name: Some(project_name),
+            editor_token: Some(editor_token),
+            no_remote_sign: false,
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            base_url: None,
+            project_name: None,
+            editor_token: None,
+            no_remote_sign: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,17 +703,177 @@ impl ExportMode {
         }
     }
 
-    fn custom_template_key(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Self::Debug => "custom_template/debug",
-            Self::Release => "custom_template/release",
+            Self::Debug => "debug",
+            Self::Release => "release",
         }
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct GeneratedAndroidKeystoreMetadata {
+    alias: String,
+    password: String,
+}
+
+fn prepare_android_keystore_override(
+    cwd: &Path,
+    project: &ProjectConfig,
+    target_platform: &str,
+    mode: ExportMode,
+    editor: &Path,
+) -> Result<Option<GeneratedAndroidKeystore>> {
+    if target_platform != "android" {
+        return Ok(None);
+    }
+    let Some(config) = android_export_config(project) else {
+        return Ok(None);
+    };
+    if !config.signed.unwrap_or(false) {
+        return Ok(None);
+    }
+    let configured_keystore = android_mode_keystore_config(config, mode);
+    if !keystore_path(configured_keystore).trim().is_empty() {
+        return Ok(None);
+    }
+
+    let android_env = ensure_android_environment(editor)?;
+    let keystore =
+        ensure_generated_android_keystore(cwd, mode, configured_keystore, &android_env.java_home)?;
+    eprintln!(
+        "pug: using generated temporary Android {} keystore {}",
+        mode.name(),
+        keystore.path.display()
+    );
+    Ok(Some(keystore))
+}
+
+fn android_mode_keystore_config(
+    config: &ProjectPlatformConfig,
+    mode: ExportMode,
+) -> Option<&AndroidKeystoreConfig> {
+    match mode {
+        ExportMode::Debug => config.debug_keystore.as_ref(),
+        ExportMode::Release => config.release_keystore.as_ref(),
+    }
+}
+
+fn ensure_generated_android_keystore(
+    cwd: &Path,
+    mode: ExportMode,
+    configured: Option<&AndroidKeystoreConfig>,
+    java_home: &Path,
+) -> Result<GeneratedAndroidKeystore> {
+    let dir = cwd.join(".godot").join("pug").join("android_keystores");
+    let keystore_path = dir.join(format!("temporary-{}.keystore", mode.name()));
+    let metadata_path = dir.join(format!("temporary-{}.json", mode.name()));
+    let configured_alias = optional_keystore_alias(configured);
+    let configured_password = optional_keystore_password(configured);
+    let has_config_override = configured_alias.is_some() || configured_password.is_some();
+
+    if !has_config_override && keystore_path.is_file() {
+        if let Some(metadata) = read_generated_android_keystore_metadata(&metadata_path)? {
+            return Ok(GeneratedAndroidKeystore {
+                mode,
+                path: keystore_path,
+                alias: metadata.alias,
+                password: metadata.password,
+            });
+        }
+    }
+
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    if keystore_path.exists() {
+        fs::remove_file(&keystore_path)
+            .with_context(|| format!("remove {}", keystore_path.display()))?;
+    }
+    let metadata = GeneratedAndroidKeystoreMetadata {
+        alias: configured_alias.unwrap_or_else(|| format!("pug-{}", mode.name())),
+        password: configured_password.unwrap_or_else(generate_android_keystore_password),
+    };
+    generate_android_keystore(
+        java_home,
+        &keystore_path,
+        &metadata.alias,
+        &metadata.password,
+    )?;
+    util::write_json(&metadata_path, &metadata)?;
+    Ok(GeneratedAndroidKeystore {
+        mode,
+        path: keystore_path,
+        alias: metadata.alias,
+        password: metadata.password,
+    })
+}
+
+fn read_generated_android_keystore_metadata(
+    path: &Path,
+) -> Result<Option<GeneratedAndroidKeystoreMetadata>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata: GeneratedAndroidKeystoreMetadata = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if metadata.alias.trim().is_empty() || metadata.password.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
+}
+
+fn generate_android_keystore(
+    java_home: &Path,
+    path: &Path,
+    alias: &str,
+    password: &str,
+) -> Result<()> {
+    let keytool = java_tool_path(java_home, "keytool");
+    let mut cmd = Command::new(&keytool);
+    cmd.args(["-genkeypair", "-v", "-keystore"])
+        .arg(path)
+        .args([
+            "-storepass",
+            password,
+            "-keypass",
+            password,
+            "-alias",
+            alias,
+            "-keyalg",
+            "RSA",
+            "-keysize",
+            "2048",
+            "-validity",
+            "10000",
+            "-dname",
+            "CN=pug temporary Android export,O=pug,C=US",
+            "-noprompt",
+        ]);
+    let output = cmd
+        .output()
+        .with_context(|| format!("spawn {}", keytool.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "keytool failed ({}) while generating temporary Android keystore {}\n{}",
+            output.status,
+            path.display(),
+            stderr
+        );
+    }
+    Ok(())
+}
+
+fn generate_android_keystore_password() -> String {
+    let mut rng = rand::rng();
+    (0..32)
+        .map(|_| char::from(rng.sample(Alphanumeric)))
+        .collect()
+}
+
 #[derive(Debug)]
 struct ExportPreset {
-    index: usize,
     name: String,
     platform: String,
     export_path: PathBuf,
@@ -364,14 +885,738 @@ struct ExportTemplates {
     android_source_template: Option<PathBuf>,
 }
 
+struct GeneratedAndroidKeystore {
+    mode: ExportMode,
+    path: PathBuf,
+    alias: String,
+    password: String,
+}
+
+struct ExportTemplateOverride<'a> {
+    platform: &'a str,
+    mode: ExportMode,
+    templates: &'a ExportTemplates,
+    android_keystore: Option<&'a GeneratedAndroidKeystore>,
+}
+
 fn read_project(cwd: &Path) -> Result<ProjectConfig> {
     let path = cwd.join("project.pug.json");
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    let mut project: ProjectConfig =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    migrate_legacy_export_platforms(&mut project)?;
+    Ok(project)
 }
 
 fn write_project(cwd: &Path, project: &ProjectConfig) -> Result<()> {
     util::write_json(&cwd.join("project.pug.json"), project)
+}
+
+fn migrate_legacy_export_platforms(project: &mut ProjectConfig) -> Result<()> {
+    let Some(export) = project.export.as_mut() else {
+        return Ok(());
+    };
+    for (platform_name, config) in [
+        ("windows", export.windows.take()),
+        ("macos", export.macos.take()),
+        ("linux", export.linux.take()),
+        ("ios", export.ios.take()),
+        ("android", export.android.take()),
+    ] {
+        if let Some(config) = config
+            && project.platforms.get(platform_name).is_some()
+        {
+            project
+                .platforms
+                .merge_config(platform_name, config)
+                .map_err(|err| anyhow::anyhow!(err))?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_export_presets(
+    cwd: &Path,
+    project: &ProjectConfig,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+) -> Result<Vec<ExportPreset>> {
+    let (text, presets) = render_export_presets(project, template_override)?;
+    let path = cwd.join("export_presets.cfg");
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    update_gitignore(cwd)?;
+    Ok(presets)
+}
+
+fn render_export_presets(
+    project: &ProjectConfig,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+) -> Result<(String, Vec<ExportPreset>)> {
+    let platforms = export_platforms(project)?;
+    let display_name = export_display_name(project);
+    let encrypt_pck = export_encrypt_pck(project);
+    let encrypt_directory = export_encrypt_directory(project);
+    let include_filters = export_config(project)
+        .and_then(|export| export.encryption_include_filters.as_deref())
+        .unwrap_or("*");
+    let exclude_filters = export_config(project)
+        .and_then(|export| export.encryption_exclude_filters.as_deref())
+        .unwrap_or(".godot/extension_list.cfg,*.gdextension,.godot_custom/signatures.csv");
+
+    let mut text = String::from(
+        "; This file is generated by pug from project.pug.json.\n; Manual changes will be overwritten by `pug project install` and `pug project export`.\n\n",
+    );
+    let mut presets = Vec::new();
+    for (index, platform_name) in platforms.iter().enumerate() {
+        let preset_name = preset_platform_name(platform_name)?;
+        let export_path = export_path_for_platform(project, platform_name, &display_name)?;
+        text.push_str(&format!("[preset.{index}]\n"));
+        text.push_str(&format!("name={}\n", cfg_string(preset_name)));
+        text.push_str(&format!("platform={}\n", cfg_string(preset_name)));
+        text.push_str(&format!(
+            "runnable={}\n",
+            cfg_bool(preset_runnable(platform_name))
+        ));
+        text.push_str("dedicated_server=false\n");
+        text.push_str("custom_features=\"\"\n");
+        text.push_str("export_filter=\"all_resources\"\n");
+        text.push_str("include_filter=\"\"\n");
+        text.push_str("exclude_filter=\"\"\n");
+        text.push_str(&format!("export_path={}\n", cfg_path(&export_path)));
+        text.push_str("patches=PackedStringArray()\n");
+        text.push_str(&format!(
+            "encryption_include_filters={}\n",
+            cfg_string(include_filters)
+        ));
+        text.push_str(&format!(
+            "encryption_exclude_filters={}\n",
+            cfg_string(exclude_filters)
+        ));
+        text.push_str(&format!("encrypt_pck={}\n", cfg_bool(encrypt_pck)));
+        text.push_str(&format!(
+            "encrypt_directory={}\n\n",
+            cfg_bool(encrypt_directory)
+        ));
+        text.push_str(&format!("[preset.{index}.options]\n"));
+        for (key, value) in
+            export_options_for_platform(project, platform_name, &display_name, template_override)?
+        {
+            text.push_str(&format!("{key}={value}\n"));
+        }
+        text.push('\n');
+        presets.push(ExportPreset {
+            name: preset_name.to_string(),
+            platform: preset_name.to_string(),
+            export_path,
+        });
+    }
+    Ok((text, presets))
+}
+
+fn export_options_for_platform(
+    project: &ProjectConfig,
+    platform_name: &str,
+    display_name: &str,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+) -> Result<Vec<(String, String)>> {
+    match platform_name {
+        "windows" | "linux" | "macos" | "ios" => {
+            desktop_export_options(project, platform_name, display_name, template_override)
+        }
+        "android" => android_export_options(project, display_name, template_override),
+        other => bail!("unsupported export platform: {other}"),
+    }
+}
+
+fn desktop_export_options(
+    project: &ProjectConfig,
+    platform_name: &str,
+    display_name: &str,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+) -> Result<Vec<(String, String)>> {
+    let config = platform_export_config(project, platform_name);
+    let mut options = vec![
+        (
+            "custom_template/debug".to_string(),
+            custom_template_value(template_override, platform_name, ExportMode::Debug),
+        ),
+        (
+            "custom_template/release".to_string(),
+            custom_template_value(template_override, platform_name, ExportMode::Release),
+        ),
+    ];
+    match platform_name {
+        "windows" => options.push((
+            "binary_format/embed_pck".to_string(),
+            cfg_bool(config.and_then(|config| config.embed_pck).unwrap_or(true)).to_string(),
+        )),
+        "macos" => {
+            let architecture = config
+                .and_then(|config| config.architecture.as_deref())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    export_arch_for_platform(project, "macos")
+                        .unwrap_or_else(|_| "arm64".to_string())
+                });
+            options.push((
+                "binary_format/architecture".to_string(),
+                cfg_string(&architecture),
+            ));
+            options.push((
+                "application/bundle_identifier".to_string(),
+                cfg_string(&bundle_identifier(project, platform_name, display_name)),
+            ));
+        }
+        "ios" => {
+            options.push((
+                "application/bundle_identifier".to_string(),
+                cfg_string(&bundle_identifier(project, platform_name, display_name)),
+            ));
+        }
+        "linux" => {}
+        other => bail!("unsupported desktop export platform: {other}"),
+    }
+    Ok(options)
+}
+
+fn android_export_options(
+    project: &ProjectConfig,
+    display_name: &str,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+) -> Result<Vec<(String, String)>> {
+    let config = android_export_config(project);
+    let package_name = config
+        .and_then(|config| config.package.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_package_name(display_name));
+    let android_name = config
+        .and_then(|config| config.name.as_deref())
+        .unwrap_or(display_name);
+    let signed = config.and_then(|config| config.signed).unwrap_or(false);
+    let enabled_arches = android_enabled_arches(project)?;
+    let debug_keystore = config.and_then(|config| config.debug_keystore.as_ref());
+    let release_keystore = config.and_then(|config| config.release_keystore.as_ref());
+
+    Ok(vec![
+        ("custom_template/debug".to_string(), cfg_string("")),
+        ("custom_template/release".to_string(), cfg_string("")),
+        (
+            "gradle_build/use_gradle_build".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "gradle_build/gradle_build_directory".to_string(),
+            cfg_string(
+                config
+                    .and_then(|config| config.gradle_build_directory.as_deref())
+                    .unwrap_or("res://android"),
+            ),
+        ),
+        (
+            "gradle_build/android_source_template".to_string(),
+            android_source_template_value(template_override),
+        ),
+        (
+            "gradle_build/compress_native_libraries".to_string(),
+            "false".to_string(),
+        ),
+        ("gradle_build/export_format".to_string(), "0".to_string()),
+        (
+            "gradle_build/min_sdk".to_string(),
+            cfg_string(
+                config
+                    .and_then(|config| config.min_sdk.as_deref())
+                    .unwrap_or(""),
+            ),
+        ),
+        (
+            "gradle_build/target_sdk".to_string(),
+            cfg_string(
+                config
+                    .and_then(|config| config.target_sdk.as_deref())
+                    .unwrap_or(""),
+            ),
+        ),
+        (
+            "gradle_build/custom_theme_attributes".to_string(),
+            "{}".to_string(),
+        ),
+        (
+            "architectures/armeabi-v7a".to_string(),
+            cfg_bool(enabled_arches.contains("armeabi-v7a")).to_string(),
+        ),
+        (
+            "architectures/arm64-v8a".to_string(),
+            cfg_bool(enabled_arches.contains("arm64-v8a")).to_string(),
+        ),
+        (
+            "architectures/x86".to_string(),
+            cfg_bool(enabled_arches.contains("x86")).to_string(),
+        ),
+        (
+            "architectures/x86_64".to_string(),
+            cfg_bool(enabled_arches.contains("x86_64")).to_string(),
+        ),
+        (
+            "keystore/debug".to_string(),
+            cfg_string(if signed {
+                keystore_path_value(debug_keystore, template_override, ExportMode::Debug)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "keystore/debug_user".to_string(),
+            cfg_string(if signed {
+                keystore_alias_value(debug_keystore, template_override, ExportMode::Debug)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "keystore/debug_password".to_string(),
+            cfg_string(if signed {
+                keystore_password_value(debug_keystore, template_override, ExportMode::Debug)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "keystore/release".to_string(),
+            cfg_string(if signed {
+                keystore_path_value(release_keystore, template_override, ExportMode::Release)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "keystore/release_user".to_string(),
+            cfg_string(if signed {
+                keystore_alias_value(release_keystore, template_override, ExportMode::Release)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "keystore/release_password".to_string(),
+            cfg_string(if signed {
+                keystore_password_value(release_keystore, template_override, ExportMode::Release)
+            } else {
+                String::new()
+            }),
+        ),
+        (
+            "version/code".to_string(),
+            config
+                .and_then(|config| config.version_code)
+                .unwrap_or(1)
+                .to_string(),
+        ),
+        (
+            "version/name".to_string(),
+            cfg_string(
+                config
+                    .and_then(|config| config.version_name.as_deref())
+                    .unwrap_or(project.version.as_str()),
+            ),
+        ),
+        ("package/unique_name".to_string(), cfg_string(&package_name)),
+        ("package/name".to_string(), cfg_string(android_name)),
+        ("package/signed".to_string(), cfg_bool(signed).to_string()),
+        ("package/app_category".to_string(), "2".to_string()),
+        (
+            "package/retain_data_on_uninstall".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "package/exclude_from_recents".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "package/show_in_android_tv".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "package/show_in_app_library".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "package/show_as_launcher_app".to_string(),
+            "false".to_string(),
+        ),
+        ("launcher_icons/main_192x192".to_string(), cfg_string("")),
+        (
+            "launcher_icons/adaptive_foreground_432x432".to_string(),
+            cfg_string(""),
+        ),
+        (
+            "launcher_icons/adaptive_background_432x432".to_string(),
+            cfg_string(""),
+        ),
+        (
+            "launcher_icons/adaptive_monochrome_432x432".to_string(),
+            cfg_string(""),
+        ),
+        ("graphics/opengl_debug".to_string(), "false".to_string()),
+        ("shader_baker/enabled".to_string(), "false".to_string()),
+        ("xr_features/xr_mode".to_string(), "0".to_string()),
+        ("gesture/swipe_to_dismiss".to_string(), "false".to_string()),
+        ("screen/immersive_mode".to_string(), "true".to_string()),
+        ("screen/edge_to_edge".to_string(), "false".to_string()),
+        ("screen/support_small".to_string(), "true".to_string()),
+        ("screen/support_normal".to_string(), "true".to_string()),
+        ("screen/support_large".to_string(), "true".to_string()),
+        ("screen/support_xlarge".to_string(), "true".to_string()),
+        (
+            "screen/background_color".to_string(),
+            "Color(0, 0, 0, 1)".to_string(),
+        ),
+        ("user_data_backup/allow".to_string(), "false".to_string()),
+        ("command_line/extra_args".to_string(), cfg_string("")),
+        ("apk_expansion/enable".to_string(), "false".to_string()),
+        ("apk_expansion/SALT".to_string(), cfg_string("")),
+        ("apk_expansion/public_key".to_string(), cfg_string("")),
+        (
+            "permissions/custom_permissions".to_string(),
+            "PackedStringArray()".to_string(),
+        ),
+        (
+            "permissions/internet".to_string(),
+            cfg_bool(
+                config
+                    .and_then(|config| config.internet_permission)
+                    .unwrap_or(true),
+            )
+            .to_string(),
+        ),
+    ])
+}
+
+fn custom_template_value(
+    template_override: Option<&ExportTemplateOverride<'_>>,
+    platform_name: &str,
+    mode: ExportMode,
+) -> String {
+    template_override
+        .filter(|template_override| {
+            template_override.platform == platform_name && template_override.mode == mode
+        })
+        .and_then(|template_override| template_override.templates.custom_template.as_ref())
+        .map(|path| cfg_path(path))
+        .unwrap_or_else(|| cfg_string(""))
+}
+
+fn android_source_template_value(template_override: Option<&ExportTemplateOverride<'_>>) -> String {
+    template_override
+        .filter(|template_override| template_override.platform == "android")
+        .and_then(|template_override| template_override.templates.android_source_template.as_ref())
+        .map(|path| cfg_path(path))
+        .unwrap_or_else(|| cfg_string(""))
+}
+
+fn export_platforms(project: &ProjectConfig) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for platform_name in project.platforms.names() {
+        preset_platform_name(&platform_name)?;
+        if seen.insert(platform_name.clone()) {
+            out.push(platform_name);
+        }
+    }
+    if out.is_empty() {
+        bail!("project.pug.json platforms must list at least one export platform");
+    }
+    Ok(out)
+}
+
+fn preset_count(project: &ProjectConfig) -> Result<usize> {
+    Ok(export_platforms(project)?.len())
+}
+
+fn export_display_name(project: &ProjectConfig) -> String {
+    export_config(project)
+        .and_then(|export| export.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| (!project.name.trim().is_empty()).then_some(project.name.as_str()))
+        .unwrap_or("Game")
+        .trim()
+        .to_string()
+}
+
+fn export_config(project: &ProjectConfig) -> Option<&ProjectExportConfig> {
+    project.export.as_ref()
+}
+
+fn platform_export_config<'a>(
+    project: &'a ProjectConfig,
+    platform_name: &str,
+) -> Option<&'a ProjectPlatformConfig> {
+    project.platforms.get(platform_name).or_else(|| {
+        let export = export_config(project)?;
+        match platform_name {
+            "windows" => export.windows.as_ref(),
+            "macos" => export.macos.as_ref(),
+            "linux" => export.linux.as_ref(),
+            "ios" => export.ios.as_ref(),
+            _ => None,
+        }
+    })
+}
+
+fn android_export_config(project: &ProjectConfig) -> Option<&ProjectPlatformConfig> {
+    project
+        .platforms
+        .get("android")
+        .or_else(|| export_config(project).and_then(|export| export.android.as_ref()))
+}
+
+fn export_path_for_platform(
+    project: &ProjectConfig,
+    platform_name: &str,
+    display_name: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = match platform_name {
+        "android" => android_export_config(project).and_then(|config| config.export_path.clone()),
+        _ => platform_export_config(project, platform_name)
+            .and_then(|config| config.export_path.clone()),
+    } {
+        return Ok(path);
+    }
+
+    let output_dir = export_config(project)
+        .and_then(|export| export.output_dir.clone())
+        .unwrap_or_else(|| {
+            PathBuf::from("../build").join(format!("{}_export", safe_file_stem(display_name)))
+        });
+    Ok(output_dir
+        .join(default_platform_output_dir(platform_name)?)
+        .join(default_export_filename(
+            project,
+            platform_name,
+            display_name,
+        )?))
+}
+
+fn default_platform_output_dir(platform_name: &str) -> Result<&'static str> {
+    Ok(match platform_name {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "android" => "Android",
+        "ios" => "iOS",
+        other => bail!("unsupported export platform: {other}"),
+    })
+}
+
+fn default_export_filename(
+    project: &ProjectConfig,
+    platform_name: &str,
+    display_name: &str,
+) -> Result<String> {
+    let stem = safe_file_stem(display_name);
+    Ok(match platform_name {
+        "windows" => format!("{stem}.exe"),
+        "macos" => format!("{stem}.app"),
+        "linux" => format!("{stem}.{}", export_arch_for_platform(project, "linux")?),
+        "android" => format!("{stem}.apk"),
+        "ios" => format!("{stem}.ipa"),
+        other => bail!("unsupported export platform: {other}"),
+    })
+}
+
+fn preset_runnable(platform_name: &str) -> bool {
+    matches!(platform_name, "windows" | "android")
+}
+
+fn export_encrypt_pck(project: &ProjectConfig) -> bool {
+    export_config(project)
+        .map(|export| {
+            export
+                .encrypt_pck
+                .or(export.encrypt)
+                .unwrap_or_else(|| export.script_encryption_key.is_some())
+        })
+        .unwrap_or(false)
+}
+
+fn export_encrypt_directory(project: &ProjectConfig) -> bool {
+    export_config(project)
+        .map(|export| {
+            export
+                .encrypt_directory
+                .or(export.encrypt)
+                .unwrap_or_else(|| export.script_encryption_key.is_some())
+        })
+        .unwrap_or(false)
+}
+
+fn export_encryption_enabled(project: &ProjectConfig) -> bool {
+    export_encrypt_pck(project) || export_encrypt_directory(project)
+}
+
+fn bundle_identifier(project: &ProjectConfig, platform_name: &str, display_name: &str) -> String {
+    platform_export_config(project, platform_name)
+        .and_then(|config| config.bundle_identifier.as_deref())
+        .map(str::to_string)
+        .or_else(|| {
+            android_export_config(project)
+                .and_then(|config| config.package.as_deref())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| default_package_name(display_name))
+}
+
+fn android_enabled_arches(project: &ProjectConfig) -> Result<BTreeSet<String>> {
+    let arches = android_export_config(project)
+        .and_then(|config| config.architectures.clone())
+        .unwrap_or_else(|| {
+            platform::default_arches("android")
+                .unwrap_or_else(|_| vec!["arm64-v8a"])
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        });
+    let mut out = BTreeSet::new();
+    for arch in arches {
+        out.insert(platform::spec("android", &arch)?.arch);
+    }
+    Ok(out)
+}
+
+fn extension_arches_for_platform(
+    project: &ProjectConfig,
+    platform_name: &str,
+) -> Result<Vec<String>> {
+    let mut out = BTreeSet::new();
+    if let Some(config) = platform_export_config(project, platform_name) {
+        if let Some(architectures) = &config.architectures {
+            for arch in architectures {
+                out.insert(platform::spec(platform_name, arch)?.arch);
+            }
+        } else if let Some(arch) = config.architecture.as_deref() {
+            out.insert(platform::spec(platform_name, arch)?.arch);
+        }
+    }
+    if out.is_empty() {
+        for arch in platform::default_arches(platform_name)? {
+            out.insert(platform::spec(platform_name, arch)?.arch);
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn keystore_path(config: Option<&AndroidKeystoreConfig>) -> &str {
+    config
+        .and_then(|config| config.path.as_deref())
+        .unwrap_or("")
+}
+
+fn optional_keystore_alias(config: Option<&AndroidKeystoreConfig>) -> Option<String> {
+    config
+        .and_then(|config| config.alias.as_deref())
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_string)
+}
+
+fn optional_keystore_password(config: Option<&AndroidKeystoreConfig>) -> Option<String> {
+    config
+        .and_then(|config| {
+            config.password.as_deref().map(str::to_string).or_else(|| {
+                config
+                    .password_env
+                    .as_deref()
+                    .and_then(|name| env::var(name).ok())
+            })
+        })
+        .map(|password| password.trim().to_string())
+        .filter(|password| !password.is_empty())
+}
+
+fn generated_android_keystore<'a>(
+    template_override: Option<&'a ExportTemplateOverride<'a>>,
+    mode: ExportMode,
+) -> Option<&'a GeneratedAndroidKeystore> {
+    template_override
+        .and_then(|template_override| template_override.android_keystore)
+        .filter(|keystore| keystore.mode == mode)
+}
+
+fn keystore_path_value(
+    config: Option<&AndroidKeystoreConfig>,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+    mode: ExportMode,
+) -> String {
+    let path = keystore_path(config).trim();
+    if !path.is_empty() {
+        return path.to_string();
+    }
+    generated_android_keystore(template_override, mode)
+        .map(|keystore| godot_path(&keystore.path))
+        .unwrap_or_default()
+}
+
+fn keystore_alias_value(
+    config: Option<&AndroidKeystoreConfig>,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+    mode: ExportMode,
+) -> String {
+    optional_keystore_alias(config)
+        .or_else(|| {
+            generated_android_keystore(template_override, mode)
+                .map(|keystore| keystore.alias.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn keystore_password_value(
+    config: Option<&AndroidKeystoreConfig>,
+    template_override: Option<&ExportTemplateOverride<'_>>,
+    mode: ExportMode,
+) -> String {
+    optional_keystore_password(config)
+        .or_else(|| {
+            generated_android_keystore(template_override, mode)
+                .map(|keystore| keystore.password.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn default_package_name(display_name: &str) -> String {
+    format!("com.example.{}", package_component(display_name))
+}
+
+fn package_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '_' {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        return "game".to_string();
+    }
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        out.insert_str(0, "app");
+    }
+    out
+}
+
+fn safe_file_stem(value: &str) -> String {
+    let stem = value
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' => '_',
+            _ => ch,
+        })
+        .collect::<String>();
+    if stem.is_empty() {
+        "Game".to_string()
+    } else {
+        stem
+    }
 }
 
 fn parse_package(value: &str) -> Result<(String, Option<String>)> {
@@ -384,23 +1629,36 @@ fn parse_package(value: &str) -> Result<(String, Option<String>)> {
     Ok((value.to_string(), None))
 }
 
-fn resolve_export_platform(opts: &ProjectExportOptions) -> Result<String> {
+fn resolve_export_platforms(opts: &ProjectExportOptions) -> Result<Vec<String>> {
     let explicit_count =
         usize::from(opts.platform.is_some()) + usize::from(opts.android) + usize::from(opts.ios);
     if explicit_count > 1 {
-        bail!("choose only one export target");
+        bail!("choose only one export target source");
     }
     if opts.android {
-        return Ok("android".to_string());
+        return Ok(vec!["android".to_string()]);
     }
     if opts.ios {
-        return Ok("ios".to_string());
+        return Ok(vec!["ios".to_string()]);
     }
-    Ok(opts
+    let raw = opts
         .platform
         .as_deref()
-        .map(platform::normalize_platform)
-        .unwrap_or_else(|| platform::host_platform().unwrap_or("windows").to_string()))
+        .map(platform::parse_platform_list)
+        .unwrap_or_else(|| vec![platform::host_platform().unwrap_or("windows").to_string()]);
+    let mut seen = BTreeSet::new();
+    let mut platforms = Vec::new();
+    for platform_name in raw {
+        let platform_name = platform::normalize_platform(&platform_name);
+        preset_platform_name(&platform_name)?;
+        if seen.insert(platform_name.clone()) {
+            platforms.push(platform_name);
+        }
+    }
+    if platforms.is_empty() {
+        bail!("choose at least one export platform");
+    }
+    Ok(platforms)
 }
 
 fn preset_platform_name(platform_name: &str) -> Result<&'static str> {
@@ -414,86 +1672,75 @@ fn preset_platform_name(platform_name: &str) -> Result<&'static str> {
     })
 }
 
-fn find_export_preset(cwd: &Path, platform_name: &str) -> Result<ExportPreset> {
-    let wanted = preset_platform_name(platform_name)?;
-    let path = cwd.join("export_presets.cfg");
-    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    parse_export_presets(&text)
-        .into_iter()
-        .find(|preset| preset.name == wanted || preset.platform == wanted)
-        .with_context(|| format!("no export preset found for platform {platform_name} ({wanted})"))
-}
-
-fn parse_export_presets(text: &str) -> Vec<ExportPreset> {
-    #[derive(Default)]
-    struct PartialPreset {
-        name: Option<String>,
-        platform: Option<String>,
-        export_path: Option<PathBuf>,
-    }
-
-    let mut current = None;
-    let mut presets = BTreeMap::<usize, PartialPreset>::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(index) = preset_section_index(trimmed) {
-            current = Some(index);
-            presets.entry(index).or_default();
-            continue;
-        }
-        if trimmed.starts_with("[preset.") && trimmed.ends_with(".options]") {
-            current = None;
-            continue;
-        }
-        let Some(index) = current else {
-            continue;
-        };
-        let Some((key, value)) = split_assignment(trimmed) else {
-            continue;
-        };
-        let preset = presets.entry(index).or_default();
-        match key {
-            "name" => preset.name = Some(unquote(value).to_string()),
-            "platform" => preset.platform = Some(unquote(value).to_string()),
-            "export_path" => preset.export_path = Some(PathBuf::from(unquote(value))),
-            _ => {}
-        }
-    }
-
-    presets
-        .into_iter()
-        .filter_map(|(index, preset)| {
-            Some(ExportPreset {
-                index,
-                name: preset.name?,
-                platform: preset.platform?,
-                export_path: preset.export_path?,
-            })
-        })
-        .collect()
-}
-
-fn preset_section_index(line: &str) -> Option<usize> {
-    let rest = line.strip_prefix("[preset.")?.strip_suffix(']')?;
-    if rest.contains('.') {
-        return None;
-    }
-    rest.parse().ok()
-}
-
-fn split_assignment(line: &str) -> Option<(&str, &str)> {
-    let (key, value) = line.split_once('=')?;
-    Some((key.trim(), value.trim()))
-}
-
-fn unquote(value: &str) -> &str {
-    value.trim().trim_matches('"')
-}
-
 fn read_metadata(dir: &Path) -> Result<PackageMetadata> {
     Ok(serde_json::from_slice(&fs::read(
         dir.join("metadata.json"),
     )?)?)
+}
+
+fn local_export_templates(
+    project: &ProjectConfig,
+    platform_name: &str,
+    mode: ExportMode,
+) -> Result<ExportTemplates> {
+    let repo_root = engine::find_repo_root()?;
+    match platform_name {
+        "android" => {
+            let template = repo_root
+                .join("build")
+                .join("android")
+                .join("export_templates")
+                .join("android_source.zip");
+            if !template.is_file() {
+                bail!(
+                    "local Android source template not found at {}",
+                    template.display()
+                );
+            }
+            eprintln!(
+                "pug: using local Android source template {}",
+                template.display()
+            );
+            Ok(ExportTemplates {
+                custom_template: None,
+                android_source_template: Some(template),
+            })
+        }
+        "ios" => {
+            let template = repo_root
+                .join("build")
+                .join("ios")
+                .join("export_templates")
+                .join("godot_ios.zip");
+            if !template.is_file() {
+                bail!("local iOS template not found at {}", template.display());
+            }
+            eprintln!("pug: using local iOS template {}", template.display());
+            Ok(ExportTemplates {
+                custom_template: Some(template),
+                android_source_template: None,
+            })
+        }
+        "macos" | "windows" | "linux" => {
+            let arch = export_arch_for_platform(project, platform_name)?;
+            let target = platform::spec(platform_name, &arch)?;
+            let dir = repo_root
+                .join("build")
+                .join(target.godot_platform)
+                .join("export_templates");
+            let template = find_template_file(&dir, mode.template_kind())?;
+            eprintln!(
+                "pug: using local {} template {}",
+                platform_name,
+                template.display()
+            );
+            Ok(ExportTemplates {
+                custom_template: Some(template),
+                android_source_template: None,
+            })
+        }
+        other => bail!("unsupported export platform: {other}"),
+    }
 }
 
 fn download_export_templates(
@@ -517,7 +1764,7 @@ fn download_export_templates(
         .join(&response.tag);
 
     if matches!(platform_name, "windows" | "macos" | "linux") {
-        let arch = default_export_arch(platform_name)?;
+        let arch = export_arch_for_platform(project, platform_name)?;
         let artifact = response
             .artifacts
             .iter()
@@ -576,6 +1823,16 @@ fn default_export_arch(platform_name: &str) -> Result<String> {
         .next()
         .map(str::to_string)
         .with_context(|| format!("no default arch for {platform_name}"))
+}
+
+fn export_arch_for_platform(project: &ProjectConfig, platform_name: &str) -> Result<String> {
+    if let Some(arch) = platform_export_config(project, platform_name)
+        .and_then(|config| config.architecture.as_deref())
+        .filter(|arch| !arch.trim().is_empty())
+    {
+        return Ok(platform::spec(platform_name, arch)?.arch);
+    }
+    default_export_arch(platform_name)
 }
 
 fn download_engine_artifact(
@@ -672,9 +1929,9 @@ fn rewrite_manifest(
 ) -> Result<()> {
     let mut text = strip_libraries(template_text);
     text.push_str("\n[libraries]\n");
-    for platform_name in &project.platforms {
-        for arch in platform::default_arches(platform_name)? {
-            let target = platform::spec(platform_name, arch)?;
+    for platform_name in export_platforms(project)? {
+        for arch in extension_arches_for_platform(project, &platform_name)? {
+            let target = platform::spec(&platform_name, &arch)?;
             let lib = find_installed_lib(cwd, name, &target.platform, &target.arch)?;
             let rel = format!(
                 "res://bin/{}/{}/{}/{}",
@@ -758,67 +2015,25 @@ fn update_extension_list(cwd: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn upsert_preset_option(text: &str, preset_index: usize, key: &str, value: &str) -> Result<String> {
-    let header = format!("[preset.{preset_index}.options]");
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let start = lines
-        .iter()
-        .position(|line| line.trim() == header)
-        .with_context(|| format!("export preset {preset_index} is missing options section"))?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with('[') && trimmed.ends_with(']')
-        })
-        .map(|offset| start + 1 + offset)
-        .unwrap_or(lines.len());
-    let prefix = format!("{key}=");
-    if let Some(index) =
-        (start + 1..end).find(|index| lines[*index].trim_start().starts_with(&prefix))
-    {
-        lines[index] = format!("{key}={value}");
-    } else {
-        lines.insert(end, format!("{key}={value}"));
-    }
-    Ok(lines.join("\n") + "\n")
+fn cfg_path(path: &Path) -> String {
+    cfg_string(godot_path(path))
 }
 
-fn quoted_godot_path(path: &Path) -> String {
-    format!("\"{}\"", godot_path(path))
+fn cfg_string(value: impl AsRef<str>) -> String {
+    format!(
+        "\"{}\"",
+        value.as_ref().replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+fn cfg_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 fn godot_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .replace('"', "\\\"")
-}
-
-fn preset_encryption_enabled(text: &str, preset_index: usize) -> bool {
-    let mut current = None;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(index) = preset_section_index(trimmed) {
-            current = Some(index);
-            continue;
-        }
-        if trimmed.starts_with("[preset.") && !trimmed.ends_with(".options]") {
-            current = None;
-            continue;
-        }
-        if current == Some(preset_index)
-            && matches!(trimmed, "encrypt_pck=true" | "encrypt_directory=true")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn count_presets(text: &str) -> usize {
-    text.lines()
-        .filter_map(|line| preset_section_index(line.trim()))
-        .count()
 }
 
 fn export_encryption_key(project: &ProjectConfig) -> Option<String> {
@@ -855,6 +2070,7 @@ fn run_godot_export(
     platform_name: &str,
     mode: ExportMode,
     install_android_template: bool,
+    remote_sign: &RemoteSignEnv,
 ) -> Result<()> {
     let android_env = if platform_name == "android" {
         Some(ensure_android_environment(editor)?)
@@ -864,6 +2080,21 @@ fn run_godot_export(
     let export_path = resolve_export_path(cwd, &preset.export_path);
     if let Some(parent) = export_path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    let integrity_status_path = cwd
+        .join(".godot")
+        .join("pug")
+        .join("integrity_export_status.json");
+    if let Some(parent) = integrity_status_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if integrity_status_path.exists() {
+        fs::remove_file(&integrity_status_path).with_context(|| {
+            format!(
+                "remove stale integrity status file {}",
+                integrity_status_path.display()
+            )
+        })?;
     }
 
     let mut cmd = Command::new(editor);
@@ -879,9 +2110,52 @@ fn run_godot_export(
         cmd.env("ANDROID_SDK_ROOT", &android_env.sdk);
         cmd.env("JAVA_HOME", &android_env.java_home);
     }
+    if remote_sign.no_remote_sign {
+        cmd.env("GODOT_CUSTOM_INTEGRITY_NO_REMOTE_SIGN", "1");
+    } else {
+        cmd.env("GODOT_CUSTOM_INTEGRITY_STATUS_PATH", &integrity_status_path);
+        if let Some(base_url) = &remote_sign.base_url {
+            cmd.env("PANNEL_BASE_URL", base_url);
+        }
+        if let Some(project_name) = &remote_sign.project_name {
+            cmd.env("GODOT_CUSTOM_INTEGRITY_PROJECT_NAME", project_name);
+        }
+        if let Some(editor_token) = &remote_sign.editor_token {
+            cmd.env("GODOT_CUSTOM_INTEGRITY_EDITOR_TOKEN", editor_token);
+        }
+    }
     util::run_command(&mut cmd)?;
+    if !remote_sign.no_remote_sign {
+        validate_remote_sign_status(&integrity_status_path)?;
+    }
     println!("exported {} -> {}", preset.name, export_path.display());
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct IntegrityExportStatus {
+    status: String,
+    #[serde(default)]
+    message: String,
+}
+
+fn validate_remote_sign_status(path: &Path) -> Result<()> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read integrity export status {}", path.display()))?;
+    let status: IntegrityExportStatus = serde_json::from_str(&text)
+        .with_context(|| format!("parse integrity export status {}", path.display()))?;
+    match status.status.as_str() {
+        "signed" | "not_needed" => Ok(()),
+        "bypassed" => bail!(
+            "remote integrity signing was bypassed by the editor: {}",
+            status.message
+        ),
+        "failed" => bail!("remote integrity signing failed: {}", status.message),
+        other => bail!(
+            "remote integrity signing returned unexpected status {other}: {}",
+            status.message
+        ),
+    }
 }
 
 fn resolve_export_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -890,6 +2164,189 @@ fn resolve_export_path(cwd: &Path, path: &Path) -> PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+fn upload_export_artifact(
+    api: &ApiClient,
+    cwd: &Path,
+    project: &ProjectConfig,
+    project_name: &str,
+    platform_name: &str,
+    mode: ExportMode,
+    export_path: &Path,
+    no_remote_sign: bool,
+) -> Result<()> {
+    let (package_path, package_type, metadata) =
+        package_export_artifact(project, platform_name, mode, export_path, no_remote_sign)?;
+    let sha = util::sha256_file(&package_path)?;
+    let size = util::file_size(&package_path)?;
+    let repo_commit = git_head(cwd).unwrap_or_default();
+    let export_path_text = export_path.to_string_lossy().to_string();
+    let init = api.export_upload_init(&ExportUploadInit {
+        project_name,
+        version: &project.version,
+        platform: platform_name,
+        mode: mode.name(),
+        package_type,
+        package_sha256: &sha,
+        package_size: size,
+        engine_tag: &project.engine.tag,
+        repo_commit: &repo_commit,
+        export_path: &export_path_text,
+        metadata,
+    })?;
+    api.put_file(&init, &package_path)?;
+    let complete = api.export_upload_complete(&init.upload_id)?;
+    println!(
+        "uploaded export {} {} -> status={} key={}",
+        platform_name,
+        mode.name(),
+        complete.status,
+        init.s3_key
+    );
+    Ok(())
+}
+
+fn package_export_artifact(
+    project: &ProjectConfig,
+    platform_name: &str,
+    mode: ExportMode,
+    export_path: &Path,
+    no_remote_sign: bool,
+) -> Result<(PathBuf, &'static str, serde_json::Value)> {
+    let integrity_mode = if no_remote_sign {
+        "no_remote_sign"
+    } else {
+        "remote_sign"
+    };
+    match platform_name {
+        "android" => {
+            if !export_path.is_file() {
+                bail!(
+                    "Android export artifact not found: {}",
+                    export_path.display()
+                );
+            }
+            let files = apk_native_library_metadata(export_path)?;
+            let apk_signed = android_export_signed(project);
+            let metadata = serde_json::json!({
+                "integrity_mode": integrity_mode,
+                "apk_signed": apk_signed,
+                "apk_signing": if apk_signed { "local" } else { "unsigned" },
+                "files": files,
+            });
+            Ok((export_path.to_path_buf(), "apk", metadata))
+        }
+        "windows" => {
+            let dir = export_path.parent().with_context(|| {
+                format!(
+                    "cannot resolve export directory for {}",
+                    export_path.display()
+                )
+            })?;
+            if !dir.is_dir() {
+                bail!("Windows export directory not found: {}", dir.display());
+            }
+            let (_temp_file, zip_path) = tempfile::Builder::new()
+                .prefix(&format!("pug-{platform_name}-{}-", mode.name()))
+                .suffix(".zip")
+                .tempfile()?
+                .keep()
+                .map_err(|err| err.error)
+                .context("persist temporary Windows export package")?;
+            drop(_temp_file);
+            util::zip_paths(&zip_path, dir, &[dir.to_path_buf()])?;
+            let files = windows_binary_metadata(dir)?;
+            let metadata = serde_json::json!({
+                "integrity_mode": integrity_mode,
+                "files": files,
+            });
+            Ok((zip_path, "zip", metadata))
+        }
+        other => bail!("export artifact upload is not supported for {other}"),
+    }
+}
+
+fn android_export_signed(project: &ProjectConfig) -> bool {
+    android_export_config(project)
+        .and_then(|config| config.signed)
+        .unwrap_or(false)
+}
+
+fn apk_native_library_metadata(apk_path: &Path) -> Result<Vec<serde_json::Value>> {
+    let file = fs::File::open(apk_path).with_context(|| format!("open {}", apk_path.display()))?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut out = Vec::new();
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index)?;
+        let name = entry.name().replace('\\', "/");
+        if !name.starts_with("lib/") || !name.ends_with(".so") {
+            continue;
+        }
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            let n = entry.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            hasher.update(&buf[..n]);
+        }
+        out.push(serde_json::json!({
+            "path": name,
+            "kind": "so",
+            "sha256": format!("{:x}", hasher.finalize()),
+            "size": size,
+        }));
+    }
+    Ok(out)
+}
+
+fn windows_binary_metadata(dir: &Path) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let kind = if file_name.ends_with(".exe") {
+            "exe"
+        } else if file_name.ends_with(".dll") {
+            "dll"
+        } else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(serde_json::json!({
+            "path": rel,
+            "kind": kind,
+            "sha256": util::sha256_file(path)?,
+            "size": util::file_size(path)?,
+        }));
+    }
+    Ok(out)
+}
+
+fn git_head(cwd: &Path) -> Result<String> {
+    util::output_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("rev-parse")
+            .arg("HEAD"),
+    )
 }
 
 struct AndroidEnvironment {
@@ -913,9 +2370,8 @@ fn ensure_android_environment(editor: &Path) -> Result<AndroidEnvironment> {
             find_on_path("java").and_then(|java| java.parent()?.parent().map(Path::to_path_buf))
         })
         .context("Java SDK not found; set JAVA_HOME or put java on PATH")?;
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
     for tool in ["java", "keytool"] {
-        let path = java_home.join("bin").join(format!("{tool}{suffix}"));
+        let path = java_tool_path(&java_home, tool);
         if !path.is_file() {
             bail!("Java SDK is incomplete, missing {}", path.display());
         }
@@ -923,6 +2379,11 @@ fn ensure_android_environment(editor: &Path) -> Result<AndroidEnvironment> {
 
     sync_android_editor_settings(editor, &sdk, &java_home)?;
     Ok(AndroidEnvironment { sdk, java_home })
+}
+
+fn java_tool_path(java_home: &Path, tool: &str) -> PathBuf {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    java_home.join("bin").join(format!("{tool}{suffix}"))
 }
 
 fn find_default_android_sdk() -> Option<PathBuf> {
@@ -1034,14 +2495,26 @@ fn upsert_editor_setting(mut text: String, key: &str, value: &Path) -> String {
 fn update_gitignore(cwd: &Path) -> Result<()> {
     let path = cwd.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == "bin/") {
+    let mut missing = Vec::new();
+    for entry in ["bin/", "export_presets.cfg", ".godot/pug/"] {
+        if !existing.lines().any(|line| line.trim() == entry) {
+            missing.push(entry);
+        }
+    }
+    if missing.is_empty() {
         return Ok(());
     }
     let mut next = existing;
     if !next.ends_with('\n') && !next.is_empty() {
         next.push('\n');
     }
-    next.push_str("\n# pug\nbin/\n");
+    if !next.lines().any(|line| line.trim() == "# pug") {
+        next.push_str("\n# pug\n");
+    }
+    for entry in missing {
+        next.push_str(entry);
+        next.push('\n');
+    }
     fs::write(path, next)?;
     Ok(())
 }
@@ -1058,6 +2531,14 @@ fn merge_json_object(value: &mut Value) -> &mut Map<String, Value> {
 mod tests {
     use super::*;
 
+    fn test_platforms(specs: &[&str]) -> ProjectPlatforms {
+        ProjectPlatforms::from_specs(specs.iter().copied()).unwrap()
+    }
+
+    fn test_platform_configs(configs: Vec<(&str, ProjectPlatformConfig)>) -> ProjectPlatforms {
+        ProjectPlatforms::from_configs(configs).unwrap()
+    }
+
     #[test]
     fn parse_package_supports_latest_and_version() {
         assert_eq!(
@@ -1071,17 +2552,90 @@ mod tests {
     }
 
     #[test]
+    fn project_version_accepts_string_and_legacy_number() {
+        let string_project: ProjectConfig = serde_json::from_str(
+            r#"{"version":"1.2.3","engine":{"tag":"test"},"platforms":["android"]}"#,
+        )
+        .unwrap();
+        let legacy_project: ProjectConfig = serde_json::from_str(
+            r#"{"version":1,"engine":{"tag":"test"},"platforms":["android"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(string_project.version, "1.2.3");
+        assert_eq!(legacy_project.version, "1");
+    }
+
+    #[test]
+    fn project_platforms_accept_config_object_and_legacy_list() {
+        let object_project: ProjectConfig = serde_json::from_str(
+            r#"{"engine":{"tag":"test"},"platforms":{"android":{"architectures":["arm64"]},"macos":{}}}"#,
+        )
+        .unwrap();
+        let legacy_project: ProjectConfig =
+            serde_json::from_str(r#"{"engine":{"tag":"test"},"platforms":["android","macos"]}"#)
+                .unwrap();
+
+        assert_eq!(
+            export_platforms(&object_project).unwrap(),
+            vec!["android".to_string(), "macos".to_string()]
+        );
+        assert_eq!(
+            export_platforms(&legacy_project).unwrap(),
+            vec!["android".to_string(), "macos".to_string()]
+        );
+        assert_eq!(
+            android_enabled_arches(&object_project).unwrap(),
+            BTreeSet::from(["arm64-v8a".to_string()])
+        );
+    }
+
+    #[test]
+    fn legacy_export_platform_config_migrates_into_platforms() {
+        let mut project: ProjectConfig = serde_json::from_str(
+            r#"{"engine":{"tag":"test"},"platforms":["android"],"export":{"android":{"package":"com.example.demo","signed":false}}}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_export_platforms(&mut project).unwrap();
+
+        let android = android_export_config(&project).unwrap();
+        assert_eq!(android.package.as_deref(), Some("com.example.demo"));
+        assert_eq!(android.signed, Some(false));
+        assert!(project.export.as_ref().unwrap().android.is_none());
+    }
+
+    #[test]
+    fn export_platforms_accept_comma_list() {
+        let opts = ProjectExportOptions {
+            platform: Some("windows,android".to_string()),
+            android: false,
+            ios: false,
+            debug: false,
+            release: true,
+            upload: false,
+            no_remote_sign: false,
+            with_engine: None,
+        };
+
+        assert_eq!(
+            resolve_export_platforms(&opts).unwrap(),
+            vec!["windows".to_string(), "android".to_string()]
+        );
+    }
+
+    #[test]
     fn locked_extension_packages_use_exact_versions() {
         let mut extensions = BTreeMap::new();
         extensions.insert("rust_demo".to_string(), "0.2.0".to_string());
         extensions.insert("netcode".to_string(), "1.0.0".to_string());
         let project = ProjectConfig {
             name: "test_project".to_string(),
-            version: 1,
+            version: "1.0.0".to_string(),
             engine: ProjectEngine {
                 tag: "test".to_string(),
             },
-            platforms: vec!["windows".to_string()],
+            platforms: test_platforms(&["windows"]),
             extensions,
             export: None,
         };
@@ -1118,6 +2672,136 @@ mod tests {
     }
 
     #[test]
+    fn managed_android_preset_uses_project_json_signing_config() {
+        let project = ProjectConfig {
+            name: "porjectK2".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![(
+                "android",
+                ProjectPlatformConfig {
+                    package: Some("com.example.demo".to_string()),
+                    signed: Some(false),
+                    architectures: Some(vec!["arm64".to_string()]),
+                    ..Default::default()
+                },
+            )]),
+            extensions: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                output_dir: Some(PathBuf::from("../build/demo_export")),
+                encrypt: Some(true),
+                script_encryption_key: Some("0123456789abcdef".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let (text, presets) = render_export_presets(&project, None).unwrap();
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(
+            presets[0].export_path,
+            PathBuf::from("../build/demo_export/Android/Demo.apk")
+        );
+        assert!(text.contains("export_path=\"../build/demo_export/Android/Demo.apk\""));
+        assert!(text.contains("encrypt_pck=true"));
+        assert!(text.contains("encrypt_directory=true"));
+        assert!(text.contains("architectures/arm64-v8a=true"));
+        assert!(text.contains("version/name=\"1.0.0\""));
+        assert!(text.contains("package/unique_name=\"com.example.demo\""));
+        assert!(text.contains("package/signed=false"));
+        assert!(text.contains("keystore/release=\"\""));
+    }
+
+    #[test]
+    fn managed_android_preset_injects_export_template_override() {
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![(
+                "android",
+                ProjectPlatformConfig {
+                    signed: Some(false),
+                    ..Default::default()
+                },
+            )]),
+            extensions: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+        };
+        let templates = ExportTemplates {
+            custom_template: None,
+            android_source_template: Some(PathBuf::from("/tmp/android_source.zip")),
+        };
+        let template_override = ExportTemplateOverride {
+            platform: "android",
+            mode: ExportMode::Release,
+            templates: &templates,
+            android_keystore: None,
+        };
+
+        let (text, _) = render_export_presets(&project, Some(&template_override)).unwrap();
+
+        assert!(text.contains("gradle_build/android_source_template=\"/tmp/android_source.zip\""));
+    }
+
+    #[test]
+    fn managed_android_preset_uses_generated_keystore_override() {
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![(
+                "android",
+                ProjectPlatformConfig {
+                    signed: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            extensions: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+        };
+        let templates = ExportTemplates {
+            custom_template: None,
+            android_source_template: None,
+        };
+        let keystore = GeneratedAndroidKeystore {
+            mode: ExportMode::Release,
+            path: PathBuf::from(".godot/pug/android_keystores/temporary-release.keystore"),
+            alias: "pug-release".to_string(),
+            password: "temporary-password".to_string(),
+        };
+        let template_override = ExportTemplateOverride {
+            platform: "android",
+            mode: ExportMode::Release,
+            templates: &templates,
+            android_keystore: Some(&keystore),
+        };
+
+        let (text, _) = render_export_presets(&project, Some(&template_override)).unwrap();
+
+        assert!(text.contains("package/signed=true"));
+        assert!(text.contains(
+            "keystore/release=\".godot/pug/android_keystores/temporary-release.keystore\""
+        ));
+        assert!(text.contains("keystore/release_user=\"pug-release\""));
+        assert!(text.contains("keystore/release_password=\"temporary-password\""));
+        assert!(text.contains("keystore/debug=\"\""));
+    }
+
+    #[test]
     fn rewrite_manifest_omits_integrity_hashes() {
         let dir = tempfile::tempdir().unwrap();
         let lib_dir = dir.path().join("bin/rust_demo/windows/x86_64");
@@ -1126,11 +2810,11 @@ mod tests {
 
         let project = ProjectConfig {
             name: "test_project".to_string(),
-            version: 1,
+            version: "1.0.0".to_string(),
             engine: ProjectEngine {
                 tag: "test".to_string(),
             },
-            platforms: vec!["windows".to_string()],
+            platforms: test_platforms(&["windows"]),
             extensions: BTreeMap::new(),
             export: None,
         };

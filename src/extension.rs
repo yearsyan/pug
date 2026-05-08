@@ -566,7 +566,7 @@ fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
             item.version,
             item.target.platform,
             item.target.arch,
-            complete.engine_tag,
+            complete.engine_tag.as_deref().unwrap_or(""),
             complete.status,
             init.s3_key
         );

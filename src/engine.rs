@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use inquire::Select;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -26,8 +27,8 @@ pub use artifacts::{git_head, godot_version};
 use artifacts::{package_engine_artifacts, upload_engine_artifacts};
 use binaries::{choose_preferred_binary, find_matching_binary, matching_binaries};
 #[cfg(test)]
-use model::{ArchSection, ProjectJson, TemplateTarget};
-use model::{BuildContext, editor_output_dir};
+use model::{ArchSection, TemplateTarget};
+use model::{BuildContext, ProjectJson, editor_output_dir};
 pub use source::find_repo_root;
 #[cfg(test)]
 use source::find_repo_root_from;
@@ -122,7 +123,11 @@ pub fn list(remote_only: bool) -> Result<()> {
     let tags = api.engine_tags_for_project(&project_name)?;
     println!("remote:");
     for tag in tags.tags {
-        let marker = if cfg.engine.current == tag.tag { "*" } else { " " };
+        let marker = if cfg.engine.current == tag.tag {
+            "*"
+        } else {
+            " "
+        };
         println!(
             "{marker} {}  godot={} short={} repo={} engine={}",
             tag.tag, tag.godot_version, tag.godot_version_short, tag.repo_commit, tag.engine_commit
@@ -300,6 +305,7 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
     let host_godot = platform::host_godot_platform()?;
     let host_arch = platform::host_arch();
     let template_targets = resolve_template_targets(&project, opts.template_platforms.as_deref())?;
+    let manifest_public_key_path = prepare_manifest_public_key(&repo_root, &project)?;
     Ok(BuildContext {
         repo_root,
         godot_src,
@@ -309,7 +315,92 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
         host_arch,
         template_targets,
         scons_args: opts.scons_args.clone(),
+        manifest_public_key_path,
     })
+}
+
+fn prepare_manifest_public_key(repo_root: &Path, project: &ProjectJson) -> Result<Option<PathBuf>> {
+    if !integrity_signing_enabled(project) {
+        return Ok(None);
+    }
+
+    let project_name = resolve_build_project_name(project)?;
+    let cfg = Config::load()?;
+    let api = ApiClient::from_config(&cfg)?;
+    let response = api
+        .manifest_public_key(&project_name)
+        .with_context(|| format!("fetch manifest public key for pannel project {project_name}"))?;
+    let public_key_pem = normalize_pem(&response.manifest_public_key_pem);
+    if public_key_pem.is_empty() {
+        bail!("pannel project {project_name} does not have a manifest public key configured");
+    }
+    let public_key_sha256 = sha256_hex(public_key_pem.as_bytes());
+    if !response.manifest_public_key_sha256.trim().is_empty()
+        && response.manifest_public_key_sha256 != public_key_sha256
+    {
+        bail!(
+            "pannel project {project_name} manifest public key hash mismatch: got {public_key_sha256} want {}",
+            response.manifest_public_key_sha256
+        );
+    }
+
+    let path = repo_root.join(".cache/pug/integrity/manifest_public.pem");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&path, public_key_pem).with_context(|| format!("write {}", path.display()))?;
+    eprintln!(
+        "pug: embedding pannel manifest public key project={} sha256={} path={}",
+        project_name,
+        public_key_sha256,
+        path.display()
+    );
+    Ok(Some(path))
+}
+
+fn integrity_signing_enabled(project: &ProjectJson) -> bool {
+    let Some(signing) = &project.signing else {
+        return false;
+    };
+    if let Some(enabled) = signing.enabled {
+        return enabled;
+    }
+    signing
+        .manifest_public_key_path
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn resolve_build_project_name(project: &ProjectJson) -> Result<String> {
+    if let Ok(name) = std::env::var("PANNEL_PROJECT_NAME")
+        && !name.trim().is_empty()
+    {
+        return Ok(name.trim().to_string());
+    }
+    project
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .context("project name is required; set project.json name or PANNEL_PROJECT_NAME")
+}
+
+fn normalize_pem(value: &str) -> String {
+    let value = value.replace("\\n", "\n");
+    let value = value.trim();
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!("{value}\n")
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn build_editor(ctx: &BuildContext) -> Result<()> {
@@ -499,6 +590,13 @@ fn run_scons(
         .filter(|key| !key.is_empty())
     {
         cmd.env("SCRIPT_AES256_ENCRYPTION_KEY", key);
+    }
+    if let Some(path) = &ctx.manifest_public_key_path {
+        cmd.arg(format!(
+            "godot_custom_manifest_public_key_path={}",
+            path_str(path)
+        ));
+        cmd.env("GODOT_CUSTOM_INTEGRITY_MANIFEST_PUBLIC_KEY_PATH", path);
     }
     cmd.args(&ctx.scons_args)
         .arg(format!(
