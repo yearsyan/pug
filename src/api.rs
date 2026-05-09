@@ -61,8 +61,8 @@ pub struct AccessTokenInfo {
     pub project_id: Option<u64>,
     pub created_by_user_id: Option<u64>,
     pub name: String,
-    pub used_at: Option<String>,
-    pub created_at: String,
+    pub used_at: Option<i64>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,8 +71,8 @@ pub struct CLISessionInfo {
     pub id: u64,
     pub user_id: u64,
     pub name: String,
-    pub used_at: Option<String>,
-    pub created_at: String,
+    pub used_at: Option<i64>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,11 +189,29 @@ pub struct ExportUploadInit<'a> {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DownloadablePackageUploadInit<'a> {
+    pub project_name: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+    pub platform: &'a str,
+    pub mode: &'a str,
+    pub pack_path: &'a str,
+    pub package_sha256: &'a str,
+    pub package_size: i64,
+    pub engine_tag: &'a str,
+    pub repo_commit: &'a str,
+    pub encrypt_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<&'a str>,
+    pub metadata: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct EditorTokenResponse {
     pub editor_token: String,
-    pub expires_at: String,
+    pub expires_at: i64,
     pub scope: String,
 }
 
@@ -276,6 +294,23 @@ impl ApiClient {
     pub fn export_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {
         self.authenticated_post_json(
             "/cli-api/v1/exports/upload/complete",
+            &CompleteUpload { upload_id },
+        )
+    }
+
+    pub fn downloadable_package_upload_init(
+        &self,
+        req: &DownloadablePackageUploadInit<'_>,
+    ) -> Result<UploadInitResponse> {
+        self.authenticated_post_json("/cli-api/v1/downloadable-packages/upload/init", req)
+    }
+
+    pub fn downloadable_package_upload_complete(
+        &self,
+        upload_id: &str,
+    ) -> Result<CompleteResponse> {
+        self.authenticated_post_json(
+            "/cli-api/v1/downloadable-packages/upload/complete",
             &CompleteUpload { upload_id },
         )
     }

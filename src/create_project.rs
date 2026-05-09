@@ -139,6 +139,7 @@ fn copy_template_dirs(
     clone_template(template, &clone_dir, checkout)?;
     copy_template_dir(&clone_dir, project_dir, "modules")?;
     copy_template_dir(&clone_dir, project_dir, "patches")?;
+    copy_template_dir(&clone_dir, project_dir, ".gitea")?;
     Ok(())
 }
 
@@ -272,22 +273,36 @@ mod tests {
     }
 
     #[test]
-    fn copy_template_dir_copies_modules_and_patches_contents() {
+    fn copy_template_copies_overlay_and_gitea_workflows() {
         let dir = tempfile::tempdir().unwrap();
         let template = dir.path().join("template");
         let project = dir.path().join("project");
         fs::create_dir_all(template.join("modules/custom")).unwrap();
         fs::create_dir_all(template.join("patches/001-test")).unwrap();
+        fs::create_dir_all(template.join(".gitea/workflows")).unwrap();
         fs::write(template.join("modules/custom/SCsub"), "pass\n").unwrap();
         fs::write(template.join("patches/001-test/description.md"), "# test\n").unwrap();
+        fs::write(
+            template.join(".gitea/workflows/pug-app-export.yml"),
+            "name: export\n",
+        )
+        .unwrap();
+        fs::write(template.join(".gitea/workflows/other.yml"), "name: other\n").unwrap();
         fs::create_dir_all(project.join("modules")).unwrap();
         fs::create_dir_all(project.join("patches")).unwrap();
 
         copy_template_dir(&template, &project, "modules").unwrap();
         copy_template_dir(&template, &project, "patches").unwrap();
+        copy_template_dir(&template, &project, ".gitea").unwrap();
 
         assert!(project.join("modules/custom/SCsub").is_file());
         assert!(project.join("patches/001-test/description.md").is_file());
+        assert!(
+            project
+                .join(".gitea/workflows/pug-app-export.yml")
+                .is_file()
+        );
+        assert!(project.join(".gitea/workflows/other.yml").is_file());
     }
 
     #[test]

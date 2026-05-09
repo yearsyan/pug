@@ -127,6 +127,10 @@ struct ExtensionBuildArgs {
     #[arg(long)]
     platform: Option<String>,
     #[arg(long)]
+    engine_tag: Option<String>,
+    #[arg(long)]
+    upload_version: Option<String>,
+    #[arg(long)]
     with_engine: Option<PathBuf>,
     #[arg(long)]
     debug: bool,
@@ -174,6 +178,27 @@ struct SetupTokenArgs {
 enum ProjectCommands {
     Install(ProjectInstallArgs),
     Export(ProjectExportArgs),
+    Pack {
+        #[command(subcommand)]
+        command: ProjectPackCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectPackCommands {
+    Add(ProjectPackAddArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProjectPackAddArgs {
+    name: String,
+    path: PathBuf,
+    #[arg(long, conflicts_with = "downloadable")]
+    internal: bool,
+    #[arg(long, conflicts_with = "internal")]
+    downloadable: bool,
+    #[arg(long, default_value = "project", value_parser = ["project", "none", "random"])]
+    encrypt_type: String,
 }
 
 #[derive(Args, Debug)]
@@ -235,6 +260,8 @@ pub fn run() -> Result<()> {
             ExtensionCommands::Build(args) => extension::build(extension::ExtensionBuildOptions {
                 upload: args.upload,
                 platform: args.platform,
+                engine_tag: args.engine_tag,
+                upload_version: args.upload_version,
                 with_engine: args.with_engine,
                 debug: args.debug,
                 force: args.force,
@@ -249,6 +276,11 @@ pub fn run() -> Result<()> {
         Commands::SetupToken(args) => config::setup_access_token(args.token),
         Commands::Project { command } => match command {
             ProjectCommands::Install(args) => project::install(args.package.as_deref()),
+            ProjectCommands::Pack { command } => match command {
+                ProjectPackCommands::Add(args) => {
+                    project::pack_add(&args.name, &args.path, args.internal, &args.encrypt_type)
+                }
+            },
             ProjectCommands::Export(args) => {
                 project::export_project(project::ProjectExportOptions {
                     platform: args.platform,

@@ -297,6 +297,19 @@ pub fn resolve_editor(with_engine: Option<&Path>) -> Result<PathBuf> {
     find_editor_in_dir(&legacy_dir)?.ok_or_else(|| anyhow!("no editor binary found"))
 }
 
+pub fn resolve_editor_for_tag(tag: &str) -> Result<PathBuf> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        bail!("engine tag must not be empty");
+    }
+    let cfg = Config::load()?;
+    let dir = cfg.install_dir()?.join(tag);
+    if !dir.is_dir() && cfg.extension.auto_fetch_engine {
+        install(Some(tag.to_string()), false)?;
+    }
+    find_editor_in_dir(&dir)?.ok_or_else(|| anyhow!("no editor binary found for engine tag {tag}"))
+}
+
 fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
     let repo_root = find_repo_root()?;
     let project = read_project_json(&repo_root)?;

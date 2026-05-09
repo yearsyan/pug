@@ -13,7 +13,7 @@ use std::{
 use walkdir::WalkDir;
 
 use crate::{
-    api::{ApiClient, EngineArtifact, ExportUploadInit},
+    api::{ApiClient, DownloadablePackageUploadInit, EngineArtifact, ExportUploadInit},
     config::Config,
     engine,
     extension::PackageMetadata,
@@ -53,6 +53,8 @@ struct ProjectConfig {
     platforms: ProjectPlatforms,
     #[serde(default)]
     extensions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    packs: BTreeMap<String, ProjectPackConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     export: Option<ProjectExportConfig>,
 }
@@ -60,6 +62,61 @@ struct ProjectConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectEngine {
     tag: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProjectPackKind {
+    Downloadable,
+    Internal,
+}
+
+impl Default for ProjectPackKind {
+    fn default() -> Self {
+        Self::Downloadable
+    }
+}
+
+impl ProjectPackKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Downloadable => "downloadable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProjectPackEncryptType {
+    Project,
+    None,
+    Random,
+}
+
+impl Default for ProjectPackEncryptType {
+    fn default() -> Self {
+        Self::Project
+    }
+}
+
+impl ProjectPackEncryptType {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::None => "none",
+            Self::Random => "random",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectPackConfig {
+    path: PathBuf,
+    #[serde(default, rename = "type")]
+    kind: ProjectPackKind,
+    #[serde(default)]
+    encrypt_type: ProjectPackEncryptType,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -365,6 +422,7 @@ pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()>
         engine: ProjectEngine { tag },
         platforms,
         extensions: BTreeMap::new(),
+        packs: BTreeMap::new(),
         export: None,
     };
     util::write_json(&path, &project)?;
@@ -389,6 +447,34 @@ pub fn install(package: Option<&str>) -> Result<()> {
     for package in packages {
         install_one(&cwd, &package)?;
     }
+    Ok(())
+}
+
+pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let mut project = read_project(&cwd)?;
+    let name = normalize_pack_name(name)?;
+    let path = normalize_pack_path(path)?;
+    let encrypt_type = parse_pack_encrypt_type(encrypt_type)?;
+    let kind = if internal {
+        ProjectPackKind::Internal
+    } else {
+        ProjectPackKind::Downloadable
+    };
+    project.packs.insert(
+        name.clone(),
+        ProjectPackConfig {
+            path: PathBuf::from(path),
+            kind,
+            encrypt_type,
+        },
+    );
+    write_project(&cwd, &project)?;
+    sync_export_presets(&cwd, &project, None)?;
+    println!(
+        "registered pack {name} ({}) in project.pug.json",
+        kind.name()
+    );
     Ok(())
 }
 
@@ -602,7 +688,7 @@ fn export_project_target(
     let presets = sync_export_presets(cwd, project, Some(&template_override))?;
     let target_preset_name = preset_platform_name(target_platform)?;
     let preset = presets
-        .into_iter()
+        .iter()
         .find(|preset| preset.platform == target_preset_name)
         .with_context(|| {
             format!(
@@ -610,12 +696,7 @@ fn export_project_target(
                 target_platform
             )
         })?;
-    if export_encryption_enabled(project) {
-        let key = export_encryption_key(project).with_context(|| {
-            "project.pug.json export enables encryption; set export.script_encryption_key or SCRIPT_AES256_ENCRYPTION_KEY"
-        })?;
-        write_export_credentials(cwd, preset_count(project)?, &key)?;
-    }
+    write_export_credentials(cwd, &presets)?;
 
     run_godot_export(
         &editor,
@@ -626,8 +707,18 @@ fn export_project_target(
         templates.android_source_template.is_some(),
         &remote_sign,
     )?;
+    export_pack_presets(&editor, cwd, project, &presets, target_platform)?;
 
     if opts.upload {
+        upload_downloadable_packs(
+            &api,
+            cwd,
+            project,
+            &project_name,
+            target_platform,
+            mode,
+            &presets,
+        )?;
         let export_path = resolve_export_path(cwd, &preset.export_path);
         upload_export_artifact(
             &api,
@@ -874,9 +965,32 @@ fn generate_android_keystore_password() -> String {
 
 #[derive(Debug)]
 struct ExportPreset {
+    index: usize,
     name: String,
     platform: String,
     export_path: PathBuf,
+    kind: ExportPresetKind,
+    credential_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExportPresetKind {
+    App,
+    Pack {
+        pack_name: String,
+        pack_kind: ProjectPackKind,
+        encrypt_type: ProjectPackEncryptType,
+    },
+}
+
+impl ExportPreset {
+    fn is_pack_for(&self, platform_name: &str, pack_kind: ProjectPackKind) -> bool {
+        self.platform == preset_platform_name(platform_name).unwrap_or("")
+            && matches!(
+                &self.kind,
+                ExportPresetKind::Pack { pack_kind: kind, .. } if *kind == pack_kind
+            )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -940,7 +1054,7 @@ fn sync_export_presets(
     project: &ProjectConfig,
     template_override: Option<&ExportTemplateOverride<'_>>,
 ) -> Result<Vec<ExportPreset>> {
-    let (text, presets) = render_export_presets(project, template_override)?;
+    let (text, presets) = render_export_presets(cwd, project, template_override)?;
     let path = cwd.join("export_presets.cfg");
     fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     update_gitignore(cwd)?;
@@ -948,6 +1062,7 @@ fn sync_export_presets(
 }
 
 fn render_export_presets(
+    cwd: &Path,
     project: &ProjectConfig,
     template_override: Option<&ExportTemplateOverride<'_>>,
 ) -> Result<(String, Vec<ExportPreset>)> {
@@ -966,9 +1081,12 @@ fn render_export_presets(
         "; This file is generated by pug from project.pug.json.\n; Manual changes will be overwritten by `pug project install` and `pug project export`.\n\n",
     );
     let mut presets = Vec::new();
-    for (index, platform_name) in platforms.iter().enumerate() {
+    for platform_name in platforms.iter() {
+        validate_platform_pack_config(project, platform_name)?;
+        let index = presets.len();
         let preset_name = preset_platform_name(platform_name)?;
         let export_path = export_path_for_platform(project, platform_name, &display_name)?;
+        let main_exclude_filter = main_pack_exclude_filter(project, platform_name)?;
         text.push_str(&format!("[preset.{index}]\n"));
         text.push_str(&format!("name={}\n", cfg_string(preset_name)));
         text.push_str(&format!("platform={}\n", cfg_string(preset_name)));
@@ -979,8 +1097,12 @@ fn render_export_presets(
         text.push_str("dedicated_server=false\n");
         text.push_str("custom_features=\"\"\n");
         text.push_str("export_filter=\"all_resources\"\n");
+        text.push_str("export_files=PackedStringArray()\n");
         text.push_str("include_filter=\"\"\n");
-        text.push_str("exclude_filter=\"\"\n");
+        text.push_str(&format!(
+            "exclude_filter={}\n",
+            cfg_string(&main_exclude_filter)
+        ));
         text.push_str(&format!("export_path={}\n", cfg_path(&export_path)));
         text.push_str("patches=PackedStringArray()\n");
         text.push_str(&format!(
@@ -1004,12 +1126,236 @@ fn render_export_presets(
         }
         text.push('\n');
         presets.push(ExportPreset {
+            index,
             name: preset_name.to_string(),
             platform: preset_name.to_string(),
             export_path,
+            kind: ExportPresetKind::App,
+            credential_key: app_preset_encryption_key(project)?,
         });
     }
+    for platform_name in platforms.iter() {
+        for (pack_name, pack) in sorted_packs(project) {
+            if !pack_needs_separate_pck(platform_name, pack) {
+                continue;
+            }
+            let index = presets.len();
+            let preset_name = pack_preset_name(platform_name, pack_name)?;
+            let platform_preset_name = preset_platform_name(platform_name)?;
+            let export_path = pack_export_path(project, platform_name, pack_name, pack)?;
+            let export_files = pack_export_files(cwd, pack_name, pack)?;
+            let (encrypt_pck, encrypt_directory, credential_key) =
+                pack_encryption_settings(project, pack)?;
+            text.push_str(&format!("[preset.{index}]\n"));
+            text.push_str(&format!("name={}\n", cfg_string(&preset_name)));
+            text.push_str(&format!("platform={}\n", cfg_string(platform_preset_name)));
+            text.push_str("runnable=false\n");
+            text.push_str("dedicated_server=false\n");
+            text.push_str("custom_features=\"\"\n");
+            text.push_str("export_filter=\"selected_resources\"\n");
+            text.push_str(&format!(
+                "export_files={}\n",
+                cfg_packed_string_array(&export_files)
+            ));
+            text.push_str("include_filter=\"\"\n");
+            text.push_str("exclude_filter=\"\"\n");
+            text.push_str(&format!("export_path={}\n", cfg_path(&export_path)));
+            text.push_str("patches=PackedStringArray()\n");
+            text.push_str(&format!(
+                "encryption_include_filters={}\n",
+                cfg_string(include_filters)
+            ));
+            text.push_str(&format!(
+                "encryption_exclude_filters={}\n",
+                cfg_string(exclude_filters)
+            ));
+            text.push_str(&format!("encrypt_pck={}\n", cfg_bool(encrypt_pck)));
+            text.push_str(&format!(
+                "encrypt_directory={}\n\n",
+                cfg_bool(encrypt_directory)
+            ));
+            text.push_str(&format!("[preset.{index}.options]\n"));
+            for (key, value) in export_options_for_platform(
+                project,
+                platform_name,
+                &display_name,
+                template_override,
+            )? {
+                text.push_str(&format!("{key}={value}\n"));
+            }
+            text.push('\n');
+            presets.push(ExportPreset {
+                index,
+                name: preset_name,
+                platform: platform_preset_name.to_string(),
+                export_path,
+                kind: ExportPresetKind::Pack {
+                    pack_name: pack_name.clone(),
+                    pack_kind: pack.kind,
+                    encrypt_type: pack.encrypt_type,
+                },
+                credential_key,
+            });
+        }
+    }
     Ok((text, presets))
+}
+
+fn sorted_packs(project: &ProjectConfig) -> Vec<(&String, &ProjectPackConfig)> {
+    project.packs.iter().collect()
+}
+
+fn validate_platform_pack_config(project: &ProjectConfig, platform_name: &str) -> Result<()> {
+    if platform_name != "android" {
+        return Ok(());
+    }
+    for (name, pack) in &project.packs {
+        if pack.kind == ProjectPackKind::Internal
+            && pack.encrypt_type != ProjectPackEncryptType::Project
+        {
+            bail!(
+                "android internal pack {name} is merged into assets.pck and must use encrypt_type=project"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn pack_needs_separate_pck(platform_name: &str, pack: &ProjectPackConfig) -> bool {
+    match pack.kind {
+        ProjectPackKind::Downloadable => true,
+        ProjectPackKind::Internal => platform_name != "android",
+    }
+}
+
+fn main_pack_exclude_filter(project: &ProjectConfig, platform_name: &str) -> Result<String> {
+    let mut filters = Vec::new();
+    for (name, pack) in &project.packs {
+        let should_exclude = match pack.kind {
+            ProjectPackKind::Downloadable => true,
+            ProjectPackKind::Internal => platform_name != "android",
+        };
+        if should_exclude {
+            let path = normalize_pack_path(&pack.path)
+                .with_context(|| format!("invalid path for pack {name}"))?;
+            filters.push(format!("{path}/*"));
+            filters.push(format!("{path}/**"));
+        }
+    }
+    Ok(filters.join(","))
+}
+
+fn pack_preset_name(platform_name: &str, pack_name: &str) -> Result<String> {
+    Ok(format!(
+        "Pug Pack {} {}",
+        preset_platform_name(platform_name)?,
+        pack_name
+    ))
+}
+
+fn pack_export_path(
+    project: &ProjectConfig,
+    platform_name: &str,
+    pack_name: &str,
+    pack: &ProjectPackConfig,
+) -> Result<PathBuf> {
+    let display_name = export_display_name(project);
+    let base_dir = export_config(project)
+        .and_then(|export| export.output_dir.clone())
+        .unwrap_or_else(|| {
+            PathBuf::from("../build").join(format!("{}_export", safe_file_stem(&display_name)))
+        });
+    let platform_dir = preset_platform_name(platform_name)?.replace(' ', "_");
+    let file_name = format!("{}.pck", safe_file_stem(pack_name));
+    let path = match pack.kind {
+        ProjectPackKind::Downloadable => base_dir
+            .join("Downloadable")
+            .join(platform_dir)
+            .join(file_name),
+        ProjectPackKind::Internal => {
+            export_path_for_platform(project, platform_name, &display_name)?
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(base_dir.join(platform_dir))
+                .join(file_name)
+        }
+    };
+    Ok(path)
+}
+
+fn pack_export_files(cwd: &Path, pack_name: &str, pack: &ProjectPackConfig) -> Result<Vec<String>> {
+    let relative = normalize_pack_path(&pack.path)
+        .with_context(|| format!("invalid path for pack {pack_name}"))?;
+    let root = cwd.join(&relative);
+    if !root.is_dir() {
+        bail!(
+            "pack {pack_name} path is not a directory: {}",
+            root.display()
+        );
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path().strip_prefix(cwd).with_context(|| {
+            format!(
+                "pack {pack_name} file is outside project root: {}",
+                entry.path().display()
+            )
+        })?;
+        let path = path
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        files.push(format!("res://{path}"));
+    }
+    files.sort();
+    if files.is_empty() {
+        bail!("pack {pack_name} does not contain files");
+    }
+    Ok(files)
+}
+
+fn app_preset_encryption_key(project: &ProjectConfig) -> Result<Option<String>> {
+    if export_encryption_enabled(project) {
+        return export_encryption_key(project).with_context(|| {
+            "project.pug.json export enables encryption; set export.script_encryption_key or SCRIPT_AES256_ENCRYPTION_KEY"
+        }).map(Some);
+    }
+    Ok(None)
+}
+
+fn pack_encryption_settings(
+    project: &ProjectConfig,
+    pack: &ProjectPackConfig,
+) -> Result<(bool, bool, Option<String>)> {
+    match pack.encrypt_type {
+        ProjectPackEncryptType::None => Ok((false, false, None)),
+        ProjectPackEncryptType::Project => {
+            if !export_encryption_enabled(project) {
+                return Ok((false, false, None));
+            }
+            let key = export_encryption_key(project).with_context(|| {
+                "pack uses encrypt_type=project but project export encryption key is not configured"
+            })?;
+            Ok((
+                export_encrypt_pck(project),
+                export_encrypt_directory(project),
+                Some(key),
+            ))
+        }
+        ProjectPackEncryptType::Random => Ok((true, true, Some(generate_pack_encryption_key()))),
+    }
+}
+
+fn generate_pack_encryption_key() -> String {
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn export_options_for_platform(
@@ -1328,10 +1674,6 @@ fn export_platforms(project: &ProjectConfig) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn preset_count(project: &ProjectConfig) -> Result<usize> {
-    Ok(export_platforms(project)?.len())
-}
-
 fn export_display_name(project: &ProjectConfig) -> String {
     export_config(project)
         .and_then(|export| export.name.as_deref())
@@ -1616,6 +1958,52 @@ fn safe_file_stem(value: &str) -> String {
         "Game".to_string()
     } else {
         stem
+    }
+}
+
+fn normalize_pack_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        bail!("pack name is required");
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("pack name must not contain path separators");
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_pack_path(path: &Path) -> Result<String> {
+    if path.is_absolute() {
+        bail!("pack path must be relative to the Godot project root");
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .with_context(|| format!("pack path is not valid UTF-8: {}", path.display()))?;
+                if part.is_empty() {
+                    continue;
+                }
+                parts.push(part.to_string());
+            }
+            std::path::Component::CurDir => {}
+            _ => bail!("pack path must stay inside the Godot project root"),
+        }
+    }
+    if parts.is_empty() {
+        bail!("pack path is required");
+    }
+    Ok(parts.join("/"))
+}
+
+fn parse_pack_encrypt_type(value: &str) -> Result<ProjectPackEncryptType> {
+    match value.trim() {
+        "project" => Ok(ProjectPackEncryptType::Project),
+        "none" => Ok(ProjectPackEncryptType::None),
+        "random" => Ok(ProjectPackEncryptType::Random),
+        other => bail!("unsupported pack encrypt_type: {other}"),
     }
 }
 
@@ -2026,6 +2414,11 @@ fn cfg_string(value: impl AsRef<str>) -> String {
     )
 }
 
+fn cfg_packed_string_array(values: &[String]) -> String {
+    let items = values.iter().map(cfg_string).collect::<Vec<_>>().join(", ");
+    format!("PackedStringArray({items})")
+}
+
 fn cfg_bool(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
@@ -2048,15 +2441,19 @@ fn export_encryption_key(project: &ProjectConfig) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
-fn write_export_credentials(cwd: &Path, preset_count: usize, key: &str) -> Result<()> {
+fn write_export_credentials(cwd: &Path, presets: &[ExportPreset]) -> Result<()> {
     let path = cwd.join(".godot").join("export_credentials.cfg");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut text = String::new();
-    for index in 0..preset_count {
+    for preset in presets {
+        let Some(key) = preset.credential_key.as_deref() else {
+            continue;
+        };
         text.push_str(&format!(
-            "[preset.{index}]\nscript_encryption_key=\"{key}\"\n\n"
+            "[preset.{}]\nscript_encryption_key=\"{key}\"\n\n",
+            preset.index
         ));
     }
     fs::write(path, text)?;
@@ -2132,6 +2529,159 @@ fn run_godot_export(
     Ok(())
 }
 
+fn export_pack_presets(
+    editor: &Path,
+    cwd: &Path,
+    project: &ProjectConfig,
+    presets: &[ExportPreset],
+    platform_name: &str,
+) -> Result<()> {
+    for preset in presets
+        .iter()
+        .filter(|preset| matches!(preset.kind, ExportPresetKind::Pack { .. }))
+        .filter(|preset| preset.platform == preset_platform_name(platform_name).unwrap_or(""))
+    {
+        run_godot_pack_export(editor, cwd, project, preset)?;
+        if let Some(key) = random_pack_key(preset) {
+            let key_path = resolve_export_path(cwd, &preset.export_path).with_extension("pck.key");
+            fs::write(&key_path, format!("{key}\n"))
+                .with_context(|| format!("write {}", key_path.display()))?;
+            println!("wrote pack key {}", key_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn random_pack_key(preset: &ExportPreset) -> Option<&str> {
+    match &preset.kind {
+        ExportPresetKind::Pack {
+            encrypt_type: ProjectPackEncryptType::Random,
+            ..
+        } => preset.credential_key.as_deref(),
+        _ => None,
+    }
+}
+
+fn run_godot_pack_export(
+    editor: &Path,
+    cwd: &Path,
+    project: &ProjectConfig,
+    preset: &ExportPreset,
+) -> Result<()> {
+    let ExportPresetKind::Pack { pack_name, .. } = &preset.kind else {
+        bail!("preset {} is not a pack preset", preset.name);
+    };
+    let pack = project
+        .packs
+        .get(pack_name)
+        .with_context(|| format!("pack {pack_name} not found in project.pug.json"))?;
+    let export_path = resolve_export_path(cwd, &preset.export_path);
+    if let Some(parent) = export_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let files = pack_export_file_entries(cwd, pack_name, pack)?;
+    let key = preset
+        .credential_key
+        .as_deref()
+        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
+    let encrypt_files = preset.credential_key.is_some();
+    let encrypt_directory = match &preset.kind {
+        ExportPresetKind::Pack {
+            encrypt_type: ProjectPackEncryptType::None,
+            ..
+        } => false,
+        ExportPresetKind::Pack {
+            encrypt_type: ProjectPackEncryptType::Random,
+            ..
+        } => true,
+        ExportPresetKind::Pack {
+            encrypt_type: ProjectPackEncryptType::Project,
+            ..
+        } => export_encrypt_directory(project),
+        ExportPresetKind::App => false,
+    };
+    let temp_dir = tempfile::Builder::new()
+        .prefix("pug-pack-export-")
+        .tempdir_in(cwd.join(".godot").join("pug"))
+        .context("create temporary pack export directory")?;
+    let script_path = temp_dir.path().join("export_pack.gd");
+    let manifest_path = temp_dir.path().join("manifest.json");
+    fs::write(&script_path, pack_exporter_script())
+        .with_context(|| format!("write {}", script_path.display()))?;
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "output": export_path.to_string_lossy(),
+            "key": key,
+            "encrypt_files": encrypt_files,
+            "encrypt_directory": encrypt_directory,
+            "files": files,
+        }))?,
+    )
+    .with_context(|| format!("write {}", manifest_path.display()))?;
+    let mut cmd = Command::new(editor);
+    cmd.args(["--headless", "--path"])
+        .arg(cwd)
+        .arg("--script")
+        .arg(&script_path)
+        .env("PUG_PACK_MANIFEST", &manifest_path);
+    util::run_command(&mut cmd)?;
+    println!("exported pack {} -> {}", preset.name, export_path.display());
+    Ok(())
+}
+
+fn pack_export_file_entries(
+    cwd: &Path,
+    pack_name: &str,
+    pack: &ProjectPackConfig,
+) -> Result<Vec<serde_json::Value>> {
+    pack_export_files(cwd, pack_name, pack)?
+        .into_iter()
+        .map(|target| {
+            let relative = target.trim_start_matches("res://");
+            Ok(serde_json::json!({
+                "target": target,
+                "source": cwd.join(relative).to_string_lossy(),
+            }))
+        })
+        .collect()
+}
+
+fn pack_exporter_script() -> &'static str {
+    r#"extends SceneTree
+
+func _init():
+	var manifest_path := OS.get_environment("PUG_PACK_MANIFEST")
+	if manifest_path.is_empty():
+		_fail("PUG_PACK_MANIFEST is not set")
+		return
+	var text := FileAccess.get_file_as_string(manifest_path)
+	var manifest = JSON.parse_string(text)
+	if typeof(manifest) != TYPE_DICTIONARY:
+		_fail("invalid pack manifest")
+		return
+	var packer := PCKPacker.new()
+	var err := packer.pck_start(manifest["output"], 32, manifest["key"], manifest["encrypt_directory"])
+	if err != OK:
+		_fail("pck_start failed: %s" % err)
+		return
+	for file in manifest["files"]:
+		err = packer.add_file(file["target"], file["source"], manifest["encrypt_files"])
+		if err != OK:
+			_fail("add_file failed for %s: %s" % [file["target"], err])
+			return
+	err = packer.flush(true)
+	if err != OK:
+		_fail("flush failed: %s" % err)
+		return
+	quit(0)
+
+func _fail(message: String):
+	push_error(message)
+	quit(1)
+"#
+}
+
 #[derive(Debug, Deserialize)]
 struct IntegrityExportStatus {
     status: String,
@@ -2204,6 +2754,76 @@ fn upload_export_artifact(
         complete.status,
         init.s3_key
     );
+    Ok(())
+}
+
+fn upload_downloadable_packs(
+    api: &ApiClient,
+    cwd: &Path,
+    project: &ProjectConfig,
+    project_name: &str,
+    platform_name: &str,
+    mode: ExportMode,
+    presets: &[ExportPreset],
+) -> Result<()> {
+    for preset in presets
+        .iter()
+        .filter(|preset| preset.is_pack_for(platform_name, ProjectPackKind::Downloadable))
+    {
+        let ExportPresetKind::Pack {
+            pack_name,
+            encrypt_type,
+            ..
+        } = &preset.kind
+        else {
+            continue;
+        };
+        let package_path = resolve_export_path(cwd, &preset.export_path);
+        if !package_path.is_file() {
+            bail!(
+                "downloadable pack artifact not found: {}",
+                package_path.display()
+            );
+        }
+        let sha = util::sha256_file(&package_path)?;
+        let size = util::file_size(&package_path)?;
+        let repo_commit = git_head(cwd).unwrap_or_default();
+        let pack_path = project
+            .packs
+            .get(pack_name)
+            .map(|pack| normalize_pack_path(&pack.path))
+            .transpose()?
+            .unwrap_or_default();
+        let metadata = serde_json::json!({
+            "export_path": package_path.to_string_lossy(),
+            "pack_kind": ProjectPackKind::Downloadable.name(),
+        });
+        let init = api.downloadable_package_upload_init(&DownloadablePackageUploadInit {
+            project_name,
+            name: pack_name,
+            version: &project.version,
+            platform: platform_name,
+            mode: mode.name(),
+            pack_path: &pack_path,
+            package_sha256: &sha,
+            package_size: size,
+            engine_tag: &project.engine.tag,
+            repo_commit: &repo_commit,
+            encrypt_type: encrypt_type.name(),
+            encryption_key: preset.credential_key.as_deref(),
+            metadata,
+        })?;
+        api.put_file(&init, &package_path)?;
+        let complete = api.downloadable_package_upload_complete(&init.upload_id)?;
+        println!(
+            "uploaded downloadable pack {} {} {} -> status={} key={}",
+            pack_name,
+            platform_name,
+            mode.name(),
+            complete.status,
+            init.s3_key
+        );
+    }
     Ok(())
 }
 
@@ -2637,6 +3257,7 @@ mod tests {
             },
             platforms: test_platforms(&["windows"]),
             extensions,
+            packs: BTreeMap::new(),
             export: None,
         };
 
@@ -2689,6 +3310,7 @@ mod tests {
                 },
             )]),
             extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
             export: Some(ProjectExportConfig {
                 name: Some("Demo".to_string()),
                 output_dir: Some(PathBuf::from("../build/demo_export")),
@@ -2698,7 +3320,7 @@ mod tests {
             }),
         };
 
-        let (text, presets) = render_export_presets(&project, None).unwrap();
+        let (text, presets) = render_export_presets(Path::new("."), &project, None).unwrap();
 
         assert_eq!(presets.len(), 1);
         assert_eq!(
@@ -2731,6 +3353,7 @@ mod tests {
                 },
             )]),
             extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
             export: Some(ProjectExportConfig {
                 name: Some("Demo".to_string()),
                 ..Default::default()
@@ -2747,7 +3370,8 @@ mod tests {
             android_keystore: None,
         };
 
-        let (text, _) = render_export_presets(&project, Some(&template_override)).unwrap();
+        let (text, _) =
+            render_export_presets(Path::new("."), &project, Some(&template_override)).unwrap();
 
         assert!(text.contains("gradle_build/android_source_template=\"/tmp/android_source.zip\""));
     }
@@ -2768,6 +3392,7 @@ mod tests {
                 },
             )]),
             extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
             export: Some(ProjectExportConfig {
                 name: Some("Demo".to_string()),
                 ..Default::default()
@@ -2790,7 +3415,8 @@ mod tests {
             android_keystore: Some(&keystore),
         };
 
-        let (text, _) = render_export_presets(&project, Some(&template_override)).unwrap();
+        let (text, _) =
+            render_export_presets(Path::new("."), &project, Some(&template_override)).unwrap();
 
         assert!(text.contains("package/signed=true"));
         assert!(text.contains(
@@ -2799,6 +3425,102 @@ mod tests {
         assert!(text.contains("keystore/release_user=\"pug-release\""));
         assert!(text.contains("keystore/release_password=\"temporary-password\""));
         assert!(text.contains("keystore/debug=\"\""));
+    }
+
+    #[test]
+    fn pack_presets_export_downloadable_and_non_android_internal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packs/dl")).unwrap();
+        fs::create_dir_all(dir.path().join("packs/internal")).unwrap();
+        fs::write(dir.path().join("packs/dl/level.tscn"), "level").unwrap();
+        fs::write(dir.path().join("packs/internal/shared.tres"), "shared").unwrap();
+
+        let mut packs = BTreeMap::new();
+        packs.insert(
+            "dl".to_string(),
+            ProjectPackConfig {
+                path: PathBuf::from("packs/dl"),
+                kind: ProjectPackKind::Downloadable,
+                encrypt_type: ProjectPackEncryptType::Random,
+            },
+        );
+        packs.insert(
+            "internal".to_string(),
+            ProjectPackConfig {
+                path: PathBuf::from("packs/internal"),
+                kind: ProjectPackKind::Internal,
+                encrypt_type: ProjectPackEncryptType::Project,
+            },
+        );
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platforms(&["android", "windows"]),
+            extensions: BTreeMap::new(),
+            packs,
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                output_dir: Some(PathBuf::from("../build/demo_export")),
+                encrypt: Some(true),
+                script_encryption_key: Some(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                ),
+                ..Default::default()
+            }),
+        };
+
+        let (text, presets) = render_export_presets(dir.path(), &project, None).unwrap();
+
+        assert!(text.contains("name=\"Pug Pack Android dl\""));
+        assert!(!text.contains("name=\"Pug Pack Android internal\""));
+        assert!(text.contains("name=\"Pug Pack Windows Desktop dl\""));
+        assert!(text.contains("name=\"Pug Pack Windows Desktop internal\""));
+        assert!(text.contains("export_filter=\"selected_resources\""));
+        assert!(text.contains("res://packs/dl/level.tscn"));
+        assert!(text.contains("res://packs/internal/shared.tres"));
+        assert!(text.contains("exclude_filter=\"packs/dl/*,packs/dl/**\""));
+        assert!(text.contains(
+            "exclude_filter=\"packs/dl/*,packs/dl/**,packs/internal/*,packs/internal/**\""
+        ));
+
+        let random = presets
+            .iter()
+            .find(|preset| preset.name == "Pug Pack Android dl")
+            .unwrap();
+        assert_eq!(random.credential_key.as_ref().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn android_internal_pack_rejects_non_project_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("packs/internal")).unwrap();
+        fs::write(dir.path().join("packs/internal/shared.tres"), "shared").unwrap();
+        let mut packs = BTreeMap::new();
+        packs.insert(
+            "internal".to_string(),
+            ProjectPackConfig {
+                path: PathBuf::from("packs/internal"),
+                kind: ProjectPackKind::Internal,
+                encrypt_type: ProjectPackEncryptType::Random,
+            },
+        );
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platforms(&["android"]),
+            extensions: BTreeMap::new(),
+            packs,
+            export: None,
+        };
+
+        let err = render_export_presets(dir.path(), &project, None).unwrap_err();
+        assert!(err.to_string().contains("must use encrypt_type=project"));
     }
 
     #[test]
@@ -2816,6 +3538,7 @@ mod tests {
             },
             platforms: test_platforms(&["windows"]),
             extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
             export: None,
         };
 

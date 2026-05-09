@@ -20,13 +20,14 @@ const ANDROID_API_LEVEL: &str = "21";
 
 #[derive(Debug, Deserialize)]
 struct ExtensionProjectJson {
-    name: Option<String>,
     platforms: Option<Vec<String>>,
 }
 
 pub struct ExtensionBuildOptions {
     pub upload: bool,
     pub platform: Option<String>,
+    pub engine_tag: Option<String>,
+    pub upload_version: Option<String>,
     pub with_engine: Option<PathBuf>,
     pub debug: bool,
     pub force: bool,
@@ -62,10 +63,18 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
     }
 
     let ext_dir = std::env::current_dir()?;
-    let (name, version) = cargo_package(&ext_dir)?;
+    let (name, cargo_version) = cargo_package(&ext_dir)?;
+    let version = opts.upload_version.unwrap_or(cargo_version);
+    validate_upload_version(&version)?;
     let profile = if opts.debug { "debug" } else { "release" };
     let targets = resolve_targets(opts.platform.as_deref())?;
-    let editor = engine::resolve_editor(opts.with_engine.as_deref())?;
+    let editor = if opts.with_engine.is_some() {
+        engine::resolve_editor(opts.with_engine.as_deref())?
+    } else if let Some(tag) = opts.engine_tag.as_deref() {
+        engine::resolve_editor_for_tag(tag)?
+    } else {
+        engine::resolve_editor(None)?
+    };
     let mut built = Vec::new();
     for target in targets {
         let lib_path = build_one(&ext_dir, &name, &target, profile, &editor)?;
@@ -94,7 +103,7 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
         println!("  lib: {}", item.lib_path.display());
     }
     if opts.upload {
-        upload(&built, opts.force)?;
+        upload(&built, opts.force, opts.engine_tag.as_deref())?;
     }
     Ok(())
 }
@@ -247,6 +256,13 @@ fn cargo_package(ext_dir: &Path) -> Result<(String, String)> {
     Ok((name, version))
 }
 
+fn validate_upload_version(version: &str) -> Result<()> {
+    if version.trim().is_empty() || version.contains('/') {
+        bail!("valid upload version is required");
+    }
+    Ok(())
+}
+
 fn build_one(
     ext_dir: &Path,
     name: &str,
@@ -303,20 +319,17 @@ fn cargo_env(editor: &Path) -> Result<Vec<(String, String)>> {
         .map(|r| r.join(".godot_rust_home"))
         .unwrap_or_else(|| std::env::temp_dir().join("pug-godot-rust-home"));
     fs::create_dir_all(&home)?;
+    fs::create_dir_all(home.join(".local/share"))?;
+    fs::create_dir_all(home.join(".config"))?;
+    let editor_command = editor.to_string_lossy().to_string();
     let mut env = vec![
         ("HOME".to_string(), home.to_string_lossy().to_string()),
         default_env_path("CARGO_HOME", ".cargo")?,
         default_env_path("RUSTUP_HOME", ".rustup")?,
         default_isolated_env_path("XDG_DATA_HOME", &home.join(".local/share")),
         default_isolated_env_path("XDG_CONFIG_HOME", &home.join(".config")),
-        (
-            "GDRUST_GODOT_BIN".to_string(),
-            editor.to_string_lossy().to_string(),
-        ),
-        (
-            "GODOT4_BIN".to_string(),
-            editor.to_string_lossy().to_string(),
-        ),
+        ("GDRUST_GODOT_BIN".to_string(), editor_command.clone()),
+        ("GODOT4_BIN".to_string(), editor_command),
     ];
     if let Some(path) = find_llvm_path() {
         env.push(("LLVM_PATH".to_string(), path.to_string_lossy().to_string()));
@@ -389,6 +402,12 @@ fn android_env(target: &TargetSpec) -> Result<Vec<(String, String)>> {
         .join("toolchains/llvm/prebuilt")
         .join(engine::android_ndk_host())
         .join("bin");
+    let sysroot = sdk
+        .join("ndk")
+        .join(ANDROID_NDK_VERSION)
+        .join("toolchains/llvm/prebuilt")
+        .join(engine::android_ndk_host())
+        .join("sysroot");
     let triple = match target.rust_target {
         "aarch64-linux-android" => "aarch64-linux-android",
         other => bail!("unsupported Android target: {other}"),
@@ -410,6 +429,16 @@ fn android_env(target: &TargetSpec) -> Result<Vec<(String, String)>> {
         (
             "RANLIB".to_string(),
             toolchain.join("llvm-ranlib").to_string_lossy().to_string(),
+        ),
+        (
+            format!(
+                "BINDGEN_EXTRA_CLANG_ARGS_{}",
+                bindgen_env_target(target.rust_target)
+            ),
+            format!(
+                "--target={triple}{ANDROID_API_LEVEL} --sysroot={}",
+                sysroot.to_string_lossy()
+            ),
         ),
     ];
     out.push((
@@ -531,25 +560,46 @@ fn strip_libraries_section(text: &str) -> String {
     text
 }
 
-fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
+fn upload(items: &[BuiltExtension], force: bool, engine_tag: Option<&str>) -> Result<()> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
-    let repo = engine::find_repo_root()?;
-    let project_name = project_name_from_repo(&repo)?;
-    let godot_src = fs::read_to_string(repo.join(".repocache")).context("read .repocache")?;
-    let godot_src = PathBuf::from(godot_src.trim());
-    let repo_commit = engine::git_head(&repo)?;
-    let engine_commit = engine::git_head(&godot_src)?;
-    let (godot_version, godot_version_short) = engine::godot_version(&godot_src)?;
+    let project_name = engine::resolve_project_name()?;
+    let engine_meta = match engine_tag {
+        Some(tag) => {
+            let tags = api.engine_tags_for_project(&project_name)?;
+            tags.tags
+                .into_iter()
+                .find(|item| item.tag == tag)
+                .with_context(|| {
+                    format!("engine tag {tag} not found in pannel project {project_name}")
+                })?
+        }
+        None => {
+            let repo = engine::find_repo_root()?;
+            let godot_src =
+                fs::read_to_string(repo.join(".repocache")).context("read .repocache")?;
+            let godot_src = PathBuf::from(godot_src.trim());
+            let repo_commit = engine::git_head(&repo)?;
+            let engine_commit = engine::git_head(&godot_src)?;
+            let (godot_version, godot_version_short) = engine::godot_version(&godot_src)?;
+            crate::api::EngineTag {
+                tag: String::new(),
+                repo_commit,
+                engine_commit,
+                godot_version,
+                godot_version_short,
+            }
+        }
+    };
     for item in items {
         let init = api.extension_upload_init(&ExtensionUploadInit {
             project_name: &project_name,
             name: &item.name,
             version: &item.version,
-            repo_commit: &repo_commit,
-            engine_commit: &engine_commit,
-            godot_version: &godot_version,
-            godot_version_short: &godot_version_short,
+            repo_commit: &engine_meta.repo_commit,
+            engine_commit: &engine_meta.engine_commit,
+            godot_version: &engine_meta.godot_version,
+            godot_version_short: &engine_meta.godot_version_short,
             platform: &item.target.platform,
             arch: &item.target.arch,
             lib_sha256: &item.lib_sha256,
@@ -574,26 +624,12 @@ fn upload(items: &[BuiltExtension], force: bool) -> Result<()> {
     Ok(())
 }
 
-fn project_name_from_repo(repo: &Path) -> Result<String> {
-    if let Ok(name) = std::env::var("PANNEL_PROJECT_NAME")
-        && !name.trim().is_empty()
-    {
-        return Ok(name.trim().to_string());
-    }
-    let path = repo.join("project.json");
-    let project: ExtensionProjectJson = serde_json::from_str(
-        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
-    )
-    .with_context(|| format!("parse {}", path.display()))?;
-    project
-        .name
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .context("project.json missing name; pannel uploads are project-scoped")
-}
-
 fn cargo_env_target(target: &str) -> String {
     target.to_ascii_uppercase().replace('-', "_")
+}
+
+fn bindgen_env_target(target: &str) -> String {
+    target.replace('-', "_")
 }
 
 fn host_rust_target() -> Result<&'static str> {
