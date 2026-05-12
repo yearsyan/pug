@@ -30,11 +30,9 @@ use binaries::{choose_preferred_binary, find_matching_binary, matching_binaries}
 use model::{ArchSection, TemplateTarget};
 use model::{BuildContext, ProjectJson, editor_output_dir};
 pub use source::find_repo_root;
-#[cfg(test)]
-use source::find_repo_root_from;
 use source::{
-    apply_patches, force_restore_godot_source, godot_tag, prepare_splash, read_project_json,
-    resolve_godot_source, restore_splash, revert_patches,
+    apply_patches, find_repo_root_from, force_restore_godot_source, godot_tag, prepare_splash,
+    read_project_json, resolve_godot_source, restore_splash, revert_patches,
 };
 #[cfg(test)]
 use targets::default_template_arches;
@@ -765,17 +763,40 @@ pub(crate) fn resolve_project_name() -> Result<String> {
         return Ok(name.trim().to_string());
     }
     let cwd = std::env::current_dir()?;
-    for candidate in [cwd.join("project.json"), cwd.join("project.pug.json")] {
-        if candidate.is_file() {
-            let value: Value = serde_json::from_slice(&fs::read(&candidate)?)?;
-            if let Some(name) = value.get("name").and_then(Value::as_str)
-                && !name.trim().is_empty()
-            {
-                return Ok(name.trim().to_string());
-            }
+    resolve_project_name_from_dir(&cwd)?
+        .context("project name is required; set project.json name or PANNEL_PROJECT_NAME")
+}
+
+fn resolve_project_name_from_dir(cwd: &Path) -> Result<Option<String>> {
+    if let Some(name) = project_name_in_dir(cwd)? {
+        return Ok(Some(name));
+    }
+
+    if let Ok(repo_root) = find_repo_root_from(cwd)
+        && repo_root != cwd
+    {
+        return project_name_in_dir(&repo_root);
+    }
+
+    Ok(None)
+}
+
+fn project_name_in_dir(dir: &Path) -> Result<Option<String>> {
+    for candidate in [dir.join("project.json"), dir.join("project.pug.json")] {
+        if !candidate.is_file() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(
+            &fs::read(&candidate).with_context(|| format!("read {}", candidate.display()))?,
+        )
+        .with_context(|| format!("parse {}", candidate.display()))?;
+        if let Some(name) = value.get("name").and_then(Value::as_str)
+            && !name.trim().is_empty()
+        {
+            return Ok(Some(name.trim().to_string()));
         }
     }
-    bail!("project name is required; set project.json name or PANNEL_PROJECT_NAME")
+    Ok(None)
 }
 
 fn existing_file(path: &Path) -> Result<PathBuf> {
@@ -901,6 +922,25 @@ index 0000000..f2ad6c7\n\
             found,
             normalize_external_path(repo.path().canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn project_name_falls_back_to_git_root_project_json() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-q"]);
+        fs::write(
+            repo.path().join("project.json"),
+            r#"{"name":"GachaGameProducer"}"#,
+        )
+        .unwrap();
+        fs::create_dir(repo.path().join("patches")).unwrap();
+        fs::create_dir(repo.path().join("modules")).unwrap();
+        let nested = repo.path().join("extensions/demo_ext");
+        fs::create_dir_all(&nested).unwrap();
+
+        let name = resolve_project_name_from_dir(&nested).unwrap().unwrap();
+
+        assert_eq!(name, "GachaGameProducer");
     }
 
     #[cfg(windows)]
