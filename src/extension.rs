@@ -396,12 +396,7 @@ fn rustup_target_add(target: &str) -> Result<()> {
 
 fn android_env(target: &TargetSpec) -> Result<Vec<(String, String)>> {
     let sdk = engine::android_sdk().context("Android SDK not found")?;
-    let toolchain = sdk
-        .join("ndk")
-        .join(ANDROID_NDK_VERSION)
-        .join("toolchains/llvm/prebuilt")
-        .join(engine::android_ndk_host())
-        .join("bin");
+    let toolchain = android_ndk_toolchain_bin(&sdk);
     let sysroot = sdk
         .join("ndk")
         .join(ANDROID_NDK_VERSION)
@@ -412,23 +407,30 @@ fn android_env(target: &TargetSpec) -> Result<Vec<(String, String)>> {
         "aarch64-linux-android" => "aarch64-linux-android",
         other => bail!("unsupported Android target: {other}"),
     };
-    let cc = toolchain.join(format!("{triple}{ANDROID_API_LEVEL}-clang"));
+    let cc = android_ndk_tool(
+        &toolchain,
+        &format!("{triple}{ANDROID_API_LEVEL}-clang"),
+        AndroidNdkToolKind::ClangWrapper,
+    );
+    let cxx = android_ndk_tool(
+        &toolchain,
+        &format!("{triple}{ANDROID_API_LEVEL}-clang++"),
+        AndroidNdkToolKind::ClangWrapper,
+    );
     let mut out = vec![
         ("CC".to_string(), cc.to_string_lossy().to_string()),
+        ("CXX".to_string(), cxx.to_string_lossy().to_string()),
         (
-            "CXX".to_string(),
-            toolchain
-                .join(format!("{triple}{ANDROID_API_LEVEL}-clang++"))
+            "AR".to_string(),
+            android_ndk_tool(&toolchain, "llvm-ar", AndroidNdkToolKind::Binary)
                 .to_string_lossy()
                 .to_string(),
         ),
         (
-            "AR".to_string(),
-            toolchain.join("llvm-ar").to_string_lossy().to_string(),
-        ),
-        (
             "RANLIB".to_string(),
-            toolchain.join("llvm-ranlib").to_string_lossy().to_string(),
+            android_ndk_tool(&toolchain, "llvm-ranlib", AndroidNdkToolKind::Binary)
+                .to_string_lossy()
+                .to_string(),
         ),
         (
             format!(
@@ -462,16 +464,35 @@ fn ios_env() -> Result<Vec<(String, String)>> {
 
 fn strip_android(lib: &Path) -> Result<()> {
     let sdk = engine::android_sdk().context("Android SDK not found")?;
-    let strip = sdk
-        .join("ndk")
-        .join(ANDROID_NDK_VERSION)
-        .join("toolchains/llvm/prebuilt")
-        .join(engine::android_ndk_host())
-        .join("bin/llvm-strip");
+    let toolchain = android_ndk_toolchain_bin(&sdk);
+    let strip = android_ndk_tool(&toolchain, "llvm-strip", AndroidNdkToolKind::Binary);
     if strip.is_file() {
         util::run_command(Command::new(strip).arg("--strip-unneeded").arg(lib))?;
     }
     Ok(())
+}
+
+fn android_ndk_toolchain_bin(sdk: &Path) -> PathBuf {
+    sdk.join("ndk")
+        .join(ANDROID_NDK_VERSION)
+        .join("toolchains/llvm/prebuilt")
+        .join(engine::android_ndk_host())
+        .join("bin")
+}
+
+#[derive(Clone, Copy)]
+enum AndroidNdkToolKind {
+    Binary,
+    ClangWrapper,
+}
+
+fn android_ndk_tool(toolchain: &Path, tool: &str, kind: AndroidNdkToolKind) -> PathBuf {
+    let suffix = match (cfg!(windows), kind) {
+        (true, AndroidNdkToolKind::Binary) => ".exe",
+        (true, AndroidNdkToolKind::ClangWrapper) => ".cmd",
+        (false, _) => "",
+    };
+    toolchain.join(format!("{tool}{suffix}"))
 }
 
 fn package_extension(
@@ -723,6 +744,25 @@ mod tests {
 
         let targets = resolve_targets_from_dir(Some(host), &ext_dir).unwrap();
         assert!(targets.iter().all(|target| target.platform == host));
+    }
+
+    #[test]
+    fn android_ndk_tools_use_host_executable_suffixes() {
+        let toolchain = PathBuf::from("ndk-bin");
+        let cc = android_ndk_tool(
+            &toolchain,
+            "aarch64-linux-android21-clang",
+            AndroidNdkToolKind::ClangWrapper,
+        );
+        let ar = android_ndk_tool(&toolchain, "llvm-ar", AndroidNdkToolKind::Binary);
+
+        if cfg!(windows) {
+            assert_eq!(cc, toolchain.join("aarch64-linux-android21-clang.cmd"));
+            assert_eq!(ar, toolchain.join("llvm-ar.exe"));
+        } else {
+            assert_eq!(cc, toolchain.join("aarch64-linux-android21-clang"));
+            assert_eq!(ar, toolchain.join("llvm-ar"));
+        }
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
