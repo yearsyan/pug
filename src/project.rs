@@ -1119,6 +1119,7 @@ fn render_export_presets(
             cfg_bool(encrypt_directory)
         ));
         text.push_str(&format!("[preset.{index}.options]\n"));
+        text.push_str("dotnet/include_debug_symbols=false\n");
         for (key, value) in
             export_options_for_platform(project, platform_name, &display_name, template_override)?
         {
@@ -1175,6 +1176,7 @@ fn render_export_presets(
                 cfg_bool(encrypt_directory)
             ));
             text.push_str(&format!("[preset.{index}.options]\n"));
+            text.push_str("dotnet/include_debug_symbols=false\n");
             for (key, value) in export_options_for_platform(
                 project,
                 platform_name,
@@ -3335,6 +3337,28 @@ mod tests {
         assert!(text.contains("package/unique_name=\"com.example.demo\""));
         assert!(text.contains("package/signed=false"));
         assert!(text.contains("keystore/release=\"\""));
+    }
+
+    #[test]
+    fn export_presets_disable_dotnet_debug_symbols() {
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![("windows", ProjectPlatformConfig::default())]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+        };
+
+        let (text, _) = render_export_presets(Path::new("."), &project, None).unwrap();
+
+        assert!(text.contains("dotnet/include_debug_symbols=false"));
     }
 
     #[test]

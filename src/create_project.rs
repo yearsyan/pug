@@ -7,6 +7,40 @@ use crate::util;
 
 const DEFAULT_GODOT_TAG: &str = "4.6.2-stable";
 const DEFAULT_PLATFORMS: [&str; 3] = ["macos:arm64", "android:arm64", "windows:x86_64"];
+const APP_EXPORT_WORKFLOW: &str = ".gitea/workflows/pug-app-export.yml";
+const GITATTRIBUTES: &str = ".gitattributes";
+const DEFAULT_GITATTRIBUTES: &str = r#"# Prefer LF everywhere, including on Windows checkouts. Git normalizes text files
+# and only keeps CRLF for formats where Windows tooling still expects it.
+* text=auto eol=lf
+
+# Scripts and config files should stay LF.
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.psd1 text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+patches/**/*.diff text eol=lf
+
+# Windows batch files are the main CRLF exception.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Keep binary assets out of line-ending normalization.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.7z binary
+*.apk binary
+*.aar binary
+*.keystore binary
+"#;
 
 #[derive(Debug, Serialize)]
 struct OverlayProjectJson<'a> {
@@ -92,6 +126,7 @@ fn create_project_files(
     create_required_dirs(project_dir)?;
     write_project_json(project_dir, project_name)?;
     write_gitignore(project_dir)?;
+    write_gitattributes(project_dir)?;
 
     if let Some(template) = template {
         copy_template_dirs(project_dir, template, checkout)?;
@@ -129,6 +164,11 @@ fn write_gitignore(project_dir: &Path) -> Result<()> {
         .with_context(|| format!("write {}", project_dir.join(".gitignore").display()))
 }
 
+fn write_gitattributes(project_dir: &Path) -> Result<()> {
+    fs::write(project_dir.join(GITATTRIBUTES), DEFAULT_GITATTRIBUTES)
+        .with_context(|| format!("write {}", project_dir.join(GITATTRIBUTES).display()))
+}
+
 fn copy_template_dirs(
     project_dir: &Path,
     template: &str,
@@ -139,7 +179,8 @@ fn copy_template_dirs(
     clone_template(template, &clone_dir, checkout)?;
     copy_template_dir(&clone_dir, project_dir, "modules")?;
     copy_template_dir(&clone_dir, project_dir, "patches")?;
-    copy_template_dir(&clone_dir, project_dir, ".gitea")?;
+    copy_template_file(&clone_dir, project_dir, APP_EXPORT_WORKFLOW)?;
+    copy_template_file(&clone_dir, project_dir, GITATTRIBUTES)?;
     Ok(())
 }
 
@@ -199,6 +240,19 @@ fn copy_template_dir(template_dir: &Path, project_dir: &Path, name: &str) -> Res
     Ok(true)
 }
 
+fn copy_template_file(template_dir: &Path, project_dir: &Path, name: &str) -> Result<bool> {
+    let src = template_dir.join(name);
+    if !src.is_file() {
+        return Ok(false);
+    }
+    let dst = project_dir.join(name);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::copy(&src, &dst).with_context(|| format!("copy template {name}"))?;
+    Ok(true)
+}
+
 fn valid_project_dir_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
@@ -254,6 +308,7 @@ mod tests {
         assert!(project_dir.join("extensions/.gitkeep").is_file());
         assert!(project_dir.join("modules/.gitkeep").is_file());
         assert!(project_dir.join("patches/.gitkeep").is_file());
+        assert!(project_dir.join(".gitattributes").is_file());
 
         let project: Value =
             serde_json::from_str(&fs::read_to_string(project_dir.join("project.json")).unwrap())
@@ -273,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_template_copies_overlay_and_gitea_workflows() {
+    fn copy_template_copies_overlay_and_app_export_workflow() {
         let dir = tempfile::tempdir().unwrap();
         let template = dir.path().join("template");
         let project = dir.path().join("project");
@@ -282,6 +337,7 @@ mod tests {
         fs::create_dir_all(template.join(".gitea/workflows")).unwrap();
         fs::write(template.join("modules/custom/SCsub"), "pass\n").unwrap();
         fs::write(template.join("patches/001-test/description.md"), "# test\n").unwrap();
+        fs::write(template.join(".gitattributes"), "* text=auto eol=lf\n").unwrap();
         fs::write(
             template.join(".gitea/workflows/pug-app-export.yml"),
             "name: export\n",
@@ -293,7 +349,8 @@ mod tests {
 
         copy_template_dir(&template, &project, "modules").unwrap();
         copy_template_dir(&template, &project, "patches").unwrap();
-        copy_template_dir(&template, &project, ".gitea").unwrap();
+        copy_template_file(&template, &project, APP_EXPORT_WORKFLOW).unwrap();
+        copy_template_file(&template, &project, GITATTRIBUTES).unwrap();
 
         assert!(project.join("modules/custom/SCsub").is_file());
         assert!(project.join("patches/001-test/description.md").is_file());
@@ -302,7 +359,8 @@ mod tests {
                 .join(".gitea/workflows/pug-app-export.yml")
                 .is_file()
         );
-        assert!(project.join(".gitea/workflows/other.yml").is_file());
+        assert!(!project.join(".gitea/workflows/other.yml").exists());
+        assert!(project.join(".gitattributes").is_file());
     }
 
     #[test]
