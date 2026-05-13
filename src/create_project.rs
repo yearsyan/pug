@@ -8,6 +8,7 @@ use crate::util;
 const DEFAULT_GODOT_TAG: &str = "4.6.2-stable";
 const DEFAULT_PLATFORMS: [&str; 3] = ["macos:arm64", "android:arm64", "windows:x86_64"];
 const APP_EXPORT_WORKFLOW: &str = ".gitea/workflows/pug-app-export.yml";
+const EXTENSION_BUILD_WORKFLOW: &str = ".gitea/workflows/pug-extension-build.yml";
 const GITATTRIBUTES: &str = ".gitattributes";
 const DEFAULT_GITATTRIBUTES: &str = r#"# Prefer LF everywhere, including on Windows checkouts. Git normalizes text files
 # and only keeps CRLF for formats where Windows tooling still expects it.
@@ -180,6 +181,7 @@ fn copy_template_dirs(
     copy_template_dir(&clone_dir, project_dir, "modules")?;
     copy_template_dir(&clone_dir, project_dir, "patches")?;
     copy_template_file(&clone_dir, project_dir, APP_EXPORT_WORKFLOW)?;
+    copy_template_file(&clone_dir, project_dir, EXTENSION_BUILD_WORKFLOW)?;
     copy_template_file(&clone_dir, project_dir, GITATTRIBUTES)?;
     Ok(())
 }
@@ -328,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_template_copies_overlay_and_app_export_workflow() {
+    fn copy_template_copies_overlay_and_workflows() {
         let dir = tempfile::tempdir().unwrap();
         let template = dir.path().join("template");
         let project = dir.path().join("project");
@@ -343,6 +345,11 @@ mod tests {
             "name: export\n",
         )
         .unwrap();
+        fs::write(
+            template.join(".gitea/workflows/pug-extension-build.yml"),
+            "name: extension\n",
+        )
+        .unwrap();
         fs::write(template.join(".gitea/workflows/other.yml"), "name: other\n").unwrap();
         fs::create_dir_all(project.join("modules")).unwrap();
         fs::create_dir_all(project.join("patches")).unwrap();
@@ -350,6 +357,7 @@ mod tests {
         copy_template_dir(&template, &project, "modules").unwrap();
         copy_template_dir(&template, &project, "patches").unwrap();
         copy_template_file(&template, &project, APP_EXPORT_WORKFLOW).unwrap();
+        copy_template_file(&template, &project, EXTENSION_BUILD_WORKFLOW).unwrap();
         copy_template_file(&template, &project, GITATTRIBUTES).unwrap();
 
         assert!(project.join("modules/custom/SCsub").is_file());
@@ -357,6 +365,11 @@ mod tests {
         assert!(
             project
                 .join(".gitea/workflows/pug-app-export.yml")
+                .is_file()
+        );
+        assert!(
+            project
+                .join(".gitea/workflows/pug-extension-build.yml")
                 .is_file()
         );
         assert!(!project.join(".gitea/workflows/other.yml").exists());
