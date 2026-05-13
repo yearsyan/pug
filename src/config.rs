@@ -107,6 +107,17 @@ impl Config {
             .or_else(|| self.configured_access_token())
     }
 
+    pub fn uses_login_session_auth(&self) -> bool {
+        if std::env::var("PANNEL_ACCESS_TOKEN")
+            .ok()
+            .and_then(clean_token)
+            .is_some()
+        {
+            return false;
+        }
+        self.configured_auth_uses_login_session()
+    }
+
     fn configured_access_token(&self) -> Option<String> {
         match self.backend.active_auth.trim() {
             AUTH_LOGIN_SESSION => clean_token(self.backend.login_session.clone())
@@ -115,6 +126,16 @@ impl Config {
                 .or_else(|| clean_token(self.backend.login_session.clone())),
             _ => clean_token(self.backend.access_token.clone())
                 .or_else(|| clean_token(self.backend.login_session.clone())),
+        }
+    }
+
+    fn configured_auth_uses_login_session(&self) -> bool {
+        let has_access_token = !self.backend.access_token.trim().is_empty();
+        let has_login_session = !self.backend.login_session.trim().is_empty();
+        match self.backend.active_auth.trim() {
+            AUTH_LOGIN_SESSION => has_login_session,
+            AUTH_ACCESS_TOKEN => !has_access_token && has_login_session,
+            _ => !has_access_token && has_login_session,
         }
     }
 
@@ -390,6 +411,26 @@ mod tests {
         assert_eq!(
             cfg.configured_access_token().as_deref(),
             Some("project-token")
+        );
+    }
+
+    #[test]
+    fn configured_login_auth_tracks_effective_auth_source() {
+        assert!(
+            config_with_auth("project-token", "login-session", AUTH_LOGIN_SESSION)
+                .configured_auth_uses_login_session()
+        );
+        assert!(
+            !config_with_auth("project-token", "login-session", AUTH_ACCESS_TOKEN)
+                .configured_auth_uses_login_session()
+        );
+        assert!(
+            config_with_auth("", "login-session", AUTH_ACCESS_TOKEN)
+                .configured_auth_uses_login_session()
+        );
+        assert!(
+            !config_with_auth("project-token", "login-session", "")
+                .configured_auth_uses_login_session()
         );
     }
 }

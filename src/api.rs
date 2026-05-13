@@ -140,7 +140,12 @@ pub struct ExtensionResolveResponse {
 #[derive(Debug, Serialize)]
 pub struct EngineUploadInit<'a> {
     pub project_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_build_id: Option<u64>,
     pub repo_commit: &'a str,
+    pub repo_dirty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_key: Option<&'a str>,
     pub engine_commit: &'a str,
     pub godot_version: &'a str,
     pub godot_version_short: &'a str,

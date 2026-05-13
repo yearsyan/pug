@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -142,9 +143,23 @@ pub(super) fn upload_engine_artifacts(
         .as_deref()
         .context("project.json missing name; pannel uploads are project-scoped")?;
     let repo_commit = git_head(&ctx.repo_root)?;
+    let repo_dirty = git_worktree_dirty(&ctx.repo_root)?;
+    let use_dev_tag = cfg.uses_login_session_auth() && repo_dirty;
+    let dev_key = use_dev_tag.then(make_dev_key);
+    if use_dev_tag {
+        println!("pug: dirty login-session build; requesting a unique dev engine tag");
+    }
     let engine_commit = git_head(&ctx.godot_src)?;
     let (godot_version, godot_version_short) = godot_version(&ctx.godot_src)?;
-    let existing = existing_engine_artifacts(&api, project_name, &repo_commit, &engine_commit)?;
+    let engine_build_id = std::env::var("PANNEL_ENGINE_BUILD_ID")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|id| *id > 0);
+    let existing = if use_dev_tag {
+        Vec::new()
+    } else {
+        existing_engine_artifacts(&api, project_name, &repo_commit, &engine_commit)?
+    };
     for artifact in artifacts {
         if let Some(remote) = existing
             .iter()
@@ -166,7 +181,10 @@ pub(super) fn upload_engine_artifacts(
         }
         let init = api.engine_upload_init(&EngineUploadInit {
             project_name,
+            engine_build_id,
             repo_commit: &repo_commit,
+            repo_dirty,
+            dev_key: dev_key.as_deref(),
             engine_commit: &engine_commit,
             godot_version: &godot_version,
             godot_version_short: &godot_version_short,
@@ -224,6 +242,25 @@ pub fn git_head(repo: &Path) -> Result<String> {
     util::output_command(Command::new("git").args(["-C", path_str(repo), "rev-parse", "HEAD"]))
 }
 
+pub fn git_worktree_dirty(repo: &Path) -> Result<bool> {
+    let status = util::output_command(Command::new("git").args([
+        "-C",
+        path_str(repo),
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ]))?;
+    Ok(!status.trim().is_empty())
+}
+
+fn make_dev_key() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
 pub fn godot_version(godot_src: &Path) -> Result<(String, String)> {
     let text = fs::read_to_string(godot_src.join("version.py"))?;
     let mut values = BTreeMap::new();
@@ -243,12 +280,14 @@ pub fn godot_version(godot_src: &Path) -> Result<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_template_arch, package_engine_artifacts, same_engine_artifact_slot};
+    use super::{
+        api_template_arch, git_worktree_dirty, package_engine_artifacts, same_engine_artifact_slot,
+    };
     use crate::{
         api::EngineArtifact as RemoteEngineArtifact,
         engine::model::{BuildContext, BuiltArtifact, ProjectJson, TemplateTarget},
     };
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, process::Command};
     use zip::ZipArchive;
 
     #[test]
@@ -276,6 +315,24 @@ mod tests {
         let remote = remote_artifact("windows", "editor", "x86_64");
         let local = built_artifact("windows", "editor", Some("arm64"));
         assert!(!same_engine_artifact_slot(&remote, &local));
+    }
+
+    #[test]
+    fn git_worktree_dirty_detects_uncommitted_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("init")
+            .status()
+            .unwrap();
+        if !init.success() {
+            return;
+        }
+
+        assert!(!git_worktree_dirty(repo.path()).unwrap());
+        fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        assert!(git_worktree_dirty(repo.path()).unwrap());
     }
 
     #[test]
