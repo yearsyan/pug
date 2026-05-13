@@ -23,7 +23,7 @@ mod source;
 mod targets;
 mod toolchain;
 
-pub use artifacts::{git_head, godot_version};
+pub use artifacts::{git_head, git_worktree_dirty, godot_version, make_dev_key};
 use artifacts::{package_engine_artifacts, upload_engine_artifacts};
 use binaries::{choose_preferred_binary, find_matching_binary, matching_binaries};
 #[cfg(test)]

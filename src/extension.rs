@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    api::{ApiClient, ExtensionUploadInit},
+    api::{ApiClient, ExtensionDevVersion, ExtensionUploadInit},
     config::Config,
     engine,
     platform::{self, TargetSpec},
@@ -57,20 +57,54 @@ struct BuiltExtension {
     package_size: i64,
 }
 
+struct UploadVersionPlan {
+    version: String,
+    repo_dirty: bool,
+    dev_key: Option<String>,
+}
+
+struct EngineUploadMetadata {
+    repo_commit: String,
+    engine_commit: String,
+    godot_version: String,
+    godot_version_short: String,
+}
+
 pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
-    if opts.upload {
-        Config::load()?.verify_access_token()?;
-    }
+    let cfg = if opts.upload {
+        let cfg = Config::load()?;
+        cfg.verify_access_token()?;
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let should_upload = opts.upload;
+    let engine_tag = opts.engine_tag.clone();
+    let upload_version = opts.upload_version;
+    let force = opts.force;
+    let platform = opts.platform;
+    let with_engine = opts.with_engine;
+    let debug = opts.debug;
 
     let ext_dir = std::env::current_dir()?;
     let (name, cargo_version) = cargo_package(&ext_dir)?;
-    let version = opts.upload_version.unwrap_or(cargo_version);
+    let version_plan = resolve_upload_version(
+        cfg.as_ref(),
+        should_upload,
+        engine_tag.as_deref(),
+        upload_version,
+        &ext_dir,
+        &name,
+        cargo_version,
+    )?;
+    let version = version_plan.version.clone();
     validate_upload_version(&version)?;
-    let profile = if opts.debug { "debug" } else { "release" };
-    let targets = resolve_targets(opts.platform.as_deref())?;
-    let editor = if opts.with_engine.is_some() {
-        engine::resolve_editor(opts.with_engine.as_deref())?
-    } else if let Some(tag) = opts.engine_tag.as_deref() {
+    let profile = if debug { "debug" } else { "release" };
+    let targets = resolve_targets(platform.as_deref())?;
+    let editor = if with_engine.is_some() {
+        engine::resolve_editor(with_engine.as_deref())?
+    } else if let Some(tag) = engine_tag.as_deref() {
         engine::resolve_editor_for_tag(tag)?
     } else {
         engine::resolve_editor(None)?
@@ -102,8 +136,14 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
         );
         println!("  lib: {}", item.lib_path.display());
     }
-    if opts.upload {
-        upload(&built, opts.force, opts.engine_tag.as_deref())?;
+    if should_upload {
+        upload(
+            &built,
+            force,
+            engine_tag.as_deref(),
+            version_plan.repo_dirty,
+            version_plan.dev_key.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -128,6 +168,112 @@ pub fn list(remote_only: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn resolve_upload_version(
+    cfg: Option<&Config>,
+    upload: bool,
+    engine_tag: Option<&str>,
+    explicit_version: Option<String>,
+    ext_dir: &Path,
+    name: &str,
+    cargo_version: String,
+) -> Result<UploadVersionPlan> {
+    if let Some(version) = explicit_version {
+        validate_upload_version(&version)?;
+        return Ok(UploadVersionPlan {
+            version,
+            repo_dirty: false,
+            dev_key: None,
+        });
+    }
+
+    validate_upload_version(&cargo_version)?;
+    let Some(cfg) = cfg else {
+        return Ok(UploadVersionPlan {
+            version: cargo_version,
+            repo_dirty: false,
+            dev_key: None,
+        });
+    };
+    if !upload || !cfg.uses_login_session_auth() {
+        return Ok(UploadVersionPlan {
+            version: cargo_version,
+            repo_dirty: false,
+            dev_key: None,
+        });
+    }
+
+    let repo_dirty = match git_root_from(ext_dir) {
+        Ok(git_root) => engine::git_worktree_dirty(&git_root)?,
+        Err(_) => false,
+    };
+    if !repo_dirty {
+        return Ok(UploadVersionPlan {
+            version: cargo_version,
+            repo_dirty: false,
+            dev_key: None,
+        });
+    }
+
+    let api = ApiClient::from_config(cfg)?;
+    let project_name = engine::resolve_project_name()?;
+    let engine_meta = resolve_engine_upload_metadata(&api, &project_name, engine_tag)?;
+    let dev_key = engine::make_dev_key();
+    let response = api.extension_dev_version(&ExtensionDevVersion {
+        project_name: &project_name,
+        name,
+        base_version: &cargo_version,
+        repo_commit: &engine_meta.repo_commit,
+        repo_dirty,
+        dev_key: &dev_key,
+        engine_commit: &engine_meta.engine_commit,
+        godot_version: &engine_meta.godot_version,
+        godot_version_short: &engine_meta.godot_version_short,
+    })?;
+    println!(
+        "pug: dirty login-session extension; using dev upload version {} from engine tag {}",
+        response.version, response.engine_tag
+    );
+    Ok(UploadVersionPlan {
+        version: response.version,
+        repo_dirty,
+        dev_key: Some(response.dev_key),
+    })
+}
+
+fn resolve_engine_upload_metadata(
+    api: &ApiClient,
+    project_name: &str,
+    engine_tag: Option<&str>,
+) -> Result<EngineUploadMetadata> {
+    if let Some(tag) = engine_tag {
+        let tags = api.engine_tags_for_project(project_name)?;
+        let tag = tags
+            .tags
+            .into_iter()
+            .find(|item| item.tag == tag)
+            .with_context(|| {
+                format!("engine tag {tag} not found in pannel project {project_name}")
+            })?;
+        return Ok(EngineUploadMetadata {
+            repo_commit: tag.repo_commit,
+            engine_commit: tag.engine_commit,
+            godot_version: tag.godot_version,
+            godot_version_short: tag.godot_version_short,
+        });
+    }
+
+    let repo = engine::find_repo_root()?;
+    let godot_src = fs::read_to_string(repo.join(".repocache")).context("read .repocache")?;
+    let godot_src = PathBuf::from(godot_src.trim());
+    let (godot_version, godot_version_short) = engine::godot_version(&godot_src)?;
+    Ok(EngineUploadMetadata {
+        repo_commit: engine::git_head(&repo)?,
+        engine_commit: engine::git_head(&godot_src)?,
+        godot_version,
+        godot_version_short,
+    })
 }
 
 fn resolve_targets(value: Option<&str>) -> Result<Vec<TargetSpec>> {
@@ -581,43 +727,25 @@ fn strip_libraries_section(text: &str) -> String {
     text
 }
 
-fn upload(items: &[BuiltExtension], force: bool, engine_tag: Option<&str>) -> Result<()> {
+fn upload(
+    items: &[BuiltExtension],
+    force: bool,
+    engine_tag: Option<&str>,
+    repo_dirty: bool,
+    dev_key: Option<&str>,
+) -> Result<()> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
     let project_name = engine::resolve_project_name()?;
-    let engine_meta = match engine_tag {
-        Some(tag) => {
-            let tags = api.engine_tags_for_project(&project_name)?;
-            tags.tags
-                .into_iter()
-                .find(|item| item.tag == tag)
-                .with_context(|| {
-                    format!("engine tag {tag} not found in pannel project {project_name}")
-                })?
-        }
-        None => {
-            let repo = engine::find_repo_root()?;
-            let godot_src =
-                fs::read_to_string(repo.join(".repocache")).context("read .repocache")?;
-            let godot_src = PathBuf::from(godot_src.trim());
-            let repo_commit = engine::git_head(&repo)?;
-            let engine_commit = engine::git_head(&godot_src)?;
-            let (godot_version, godot_version_short) = engine::godot_version(&godot_src)?;
-            crate::api::EngineTag {
-                tag: String::new(),
-                repo_commit,
-                engine_commit,
-                godot_version,
-                godot_version_short,
-            }
-        }
-    };
+    let engine_meta = resolve_engine_upload_metadata(&api, &project_name, engine_tag)?;
     for item in items {
         let init = api.extension_upload_init(&ExtensionUploadInit {
             project_name: &project_name,
             name: &item.name,
             version: &item.version,
             repo_commit: &engine_meta.repo_commit,
+            repo_dirty,
+            dev_key,
             engine_commit: &engine_meta.engine_commit,
             godot_version: &engine_meta.godot_version,
             godot_version_short: &engine_meta.godot_version_short,

@@ -138,6 +138,26 @@ pub struct ExtensionResolveResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ExtensionDevVersion<'a> {
+    pub project_name: &'a str,
+    pub name: &'a str,
+    pub base_version: &'a str,
+    pub repo_commit: &'a str,
+    pub repo_dirty: bool,
+    pub dev_key: &'a str,
+    pub engine_commit: &'a str,
+    pub godot_version: &'a str,
+    pub godot_version_short: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtensionDevVersionResponse {
+    pub version: String,
+    pub engine_tag: String,
+    pub dev_key: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct EngineUploadInit<'a> {
     pub project_name: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +187,9 @@ pub struct ExtensionUploadInit<'a> {
     pub name: &'a str,
     pub version: &'a str,
     pub repo_commit: &'a str,
+    pub repo_dirty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_key: Option<&'a str>,
     pub engine_commit: &'a str,
     pub godot_version: &'a str,
     pub godot_version_short: &'a str,
@@ -269,6 +292,13 @@ impl ApiClient {
         req: &ExtensionUploadInit<'_>,
     ) -> Result<UploadInitResponse> {
         self.authenticated_post_json("/cli-api/v1/extensions/upload/init", req)
+    }
+
+    pub fn extension_dev_version(
+        &self,
+        req: &ExtensionDevVersion<'_>,
+    ) -> Result<ExtensionDevVersionResponse> {
+        self.authenticated_post_json("/cli-api/v1/extensions/dev-version", req)
     }
 
     pub fn extension_upload_complete(&self, upload_id: &str) -> Result<CompleteResponse> {

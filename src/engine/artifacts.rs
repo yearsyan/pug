@@ -253,7 +253,7 @@ pub fn git_worktree_dirty(repo: &Path) -> Result<bool> {
     Ok(!status.trim().is_empty())
 }
 
-fn make_dev_key() -> String {
+pub fn make_dev_key() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
