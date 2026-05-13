@@ -8,7 +8,7 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use walkdir::WalkDir;
 
@@ -23,6 +23,11 @@ use crate::{
 fn default_project_version() -> String {
     "0.1.0".to_string()
 }
+
+const NUGET_CONFIG_FILE: &str = "NuGet.Config";
+const NUGET_GODOT_SOURCE: &str = "godot-local";
+const NUGET_ORG_SOURCE: &str = "nuget.org";
+const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 
 fn deserialize_project_version<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -57,11 +62,25 @@ struct ProjectConfig {
     packs: BTreeMap<String, ProjectPackConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     export: Option<ProjectExportConfig>,
+    #[serde(default, skip_serializing_if = "ProjectNugetConfig::is_empty")]
+    nuget: ProjectNugetConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectEngine {
     tag: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectNugetConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sources: BTreeMap<String, String>,
+}
+
+impl ProjectNugetConfig {
+    fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +443,7 @@ pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()>
         extensions: BTreeMap::new(),
         packs: BTreeMap::new(),
         export: None,
+        nuget: ProjectNugetConfig::default(),
     };
     util::write_json(&path, &project)?;
     update_gitignore(&cwd)?;
@@ -440,6 +460,7 @@ pub fn install(package: Option<&str>) -> Result<()> {
     let project = read_project(&cwd)?;
     let packages = locked_extension_packages(&project);
     if packages.is_empty() {
+        sync_nuget_config(&cwd, &project, None)?;
         sync_export_presets(&cwd, &project, None)?;
         println!("no extensions listed in project.pug.json");
         return Ok(());
@@ -604,6 +625,7 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     rewrite_manifest(&cwd, &name, &project, &template_text)?;
     update_extension_list(&cwd, &name)?;
     update_gitignore(&cwd)?;
+    sync_nuget_config(cwd, &project, None)?;
     sync_export_presets(&cwd, &project, None)?;
     println!("installed {package}");
     Ok(())
@@ -650,6 +672,7 @@ fn export_project_target(
     }
 
     let editor = engine::resolve_editor(opts.with_engine.as_deref())?;
+    sync_nuget_config(cwd, project, Some(&editor))?;
     let templates = if opts.with_engine.is_some() {
         match local_export_templates(project, target_platform, mode) {
             Ok(templates) => templates,
@@ -1047,6 +1070,129 @@ fn migrate_legacy_export_platforms(project: &mut ProjectConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn sync_nuget_config(
+    cwd: &Path,
+    project: &ProjectConfig,
+    resolved_editor: Option<&Path>,
+) -> Result<()> {
+    if !has_csproj(cwd)? {
+        return Ok(());
+    }
+
+    let editor = match resolved_editor {
+        Some(path) => path.to_path_buf(),
+        None => engine::resolve_editor(None)?,
+    };
+    let source_dir = godot_nuget_source_dir(&editor)?;
+    let text = render_nuget_config(project, &source_dir)?;
+    let path = cwd.join(NUGET_CONFIG_FILE);
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    update_gitignore_entries(cwd, &[NUGET_CONFIG_FILE])?;
+    warn_if_generated_file_not_ignored(cwd, NUGET_CONFIG_FILE);
+    Ok(())
+}
+
+fn has_csproj(cwd: &Path) -> Result<bool> {
+    for entry in fs::read_dir(cwd).with_context(|| format!("read {}", cwd.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("csproj"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn godot_nuget_source_dir(editor: &Path) -> Result<PathBuf> {
+    let editor_dir = editor
+        .parent()
+        .with_context(|| format!("resolve editor directory for {}", editor.display()))?;
+    let path = make_absolute_path(&editor_dir.join("GodotSharp").join("Tools").join("nupkgs"))?;
+    if !path.is_dir() {
+        bail!(
+            "C# project detected, but the resolved Godot editor does not provide NuGet packages at {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn make_absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn render_nuget_config(project: &ProjectConfig, godot_source_dir: &Path) -> Result<String> {
+    let mut text = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n",
+    );
+    text.push_str(&format!(
+        "    <add key=\"{}\" value=\"{}\" />\n",
+        xml_escape(NUGET_GODOT_SOURCE),
+        xml_escape(&nuget_path_value(godot_source_dir))
+    ));
+
+    let mut keys = BTreeSet::from([
+        NUGET_GODOT_SOURCE.to_ascii_lowercase(),
+        NUGET_ORG_SOURCE.to_ascii_lowercase(),
+    ]);
+    for (key, value) in &project.nuget.sources {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            bail!("project.pug.json nuget source key must not be empty");
+        }
+        if value.is_empty() {
+            bail!("project.pug.json nuget source {key} must not be empty");
+        }
+        let normalized = key.to_ascii_lowercase();
+        if !keys.insert(normalized) {
+            bail!("project.pug.json nuget source {key} conflicts with a generated source");
+        }
+        text.push_str(&format!(
+            "    <add key=\"{}\" value=\"{}\" />\n",
+            xml_escape(key),
+            xml_escape(value)
+        ));
+    }
+
+    text.push_str(&format!(
+        "    <add key=\"{}\" value=\"{}\" />\n",
+        xml_escape(NUGET_ORG_SOURCE),
+        xml_escape(NUGET_ORG_URL)
+    ));
+    text.push_str("  </packageSources>\n</configuration>\n");
+    Ok(text)
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn nuget_path_value(path: &Path) -> String {
+    let value = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        value.replace('/', "\\")
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
 }
 
 fn sync_export_presets(
@@ -3115,12 +3261,16 @@ fn upsert_editor_setting(mut text: String, key: &str, value: &Path) -> String {
 }
 
 fn update_gitignore(cwd: &Path) -> Result<()> {
+    update_gitignore_entries(cwd, &["bin/", "export_presets.cfg", ".godot/pug/"])
+}
+
+fn update_gitignore_entries(cwd: &Path, entries: &[&str]) -> Result<()> {
     let path = cwd.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let mut missing = Vec::new();
-    for entry in ["bin/", "export_presets.cfg", ".godot/pug/"] {
-        if !existing.lines().any(|line| line.trim() == entry) {
-            missing.push(entry);
+    for entry in entries {
+        if !existing.lines().any(|line| line.trim() == *entry) {
+            missing.push(*entry);
         }
     }
     if missing.is_empty() {
@@ -3139,6 +3289,35 @@ fn update_gitignore(cwd: &Path) -> Result<()> {
     }
     fs::write(path, next)?;
     Ok(())
+}
+
+fn warn_if_generated_file_not_ignored(cwd: &Path, path: &str) {
+    if !git_command_success(cwd, &["rev-parse", "--is-inside-work-tree"]).unwrap_or(false) {
+        return;
+    }
+    if git_command_success(cwd, &["ls-files", "--error-unmatch", "--", path]).unwrap_or(false) {
+        eprintln!(
+            "warning: {path} is generated by pug but is tracked by git; run `git rm --cached {path}`"
+        );
+        return;
+    }
+    if !git_command_success(cwd, &["check-ignore", "--quiet", "--", path]).unwrap_or(false) {
+        eprintln!(
+            "warning: {path} is generated by pug but is not ignored by git; add it to .gitignore"
+        );
+    }
+}
+
+fn git_command_success(cwd: &Path, args: &[&str]) -> Option<bool> {
+    Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success())
 }
 
 #[allow(dead_code)]
@@ -3247,6 +3426,94 @@ mod tests {
     }
 
     #[test]
+    fn sync_nuget_config_generates_config_for_csproj_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("demo.csproj"), "<Project />\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "# existing\n").unwrap();
+
+        let editor_dir = dir.path().join("engine");
+        fs::create_dir_all(editor_dir.join("GodotSharp/Tools/nupkgs")).unwrap();
+        let editor = editor_dir.join("godot.windows.editor.x86_64.mono.exe");
+        fs::write(&editor, "editor").unwrap();
+
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "private-feed".to_string(),
+            "https://packages.example.test/index.json".to_string(),
+        );
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platforms(&["windows"]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: None,
+            nuget: ProjectNugetConfig { sources },
+        };
+
+        sync_nuget_config(dir.path(), &project, Some(&editor)).unwrap();
+
+        let config = fs::read_to_string(dir.path().join(NUGET_CONFIG_FILE)).unwrap();
+        assert!(config.contains("<clear />"));
+        assert!(config.contains("key=\"godot-local\""));
+        assert!(config.contains("GodotSharp"));
+        assert!(config.contains("key=\"private-feed\""));
+        assert!(config.contains("key=\"nuget.org\""));
+
+        let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|line| line == NUGET_CONFIG_FILE));
+    }
+
+    #[test]
+    fn sync_nuget_config_skips_projects_without_csproj() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platforms(&["windows"]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: None,
+            nuget: ProjectNugetConfig::default(),
+        };
+
+        sync_nuget_config(dir.path(), &project, Some(Path::new("missing-editor"))).unwrap();
+
+        assert!(!dir.path().join(NUGET_CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn render_nuget_config_rejects_generated_source_conflicts() {
+        let mut sources = BTreeMap::new();
+        sources.insert("godot-local".to_string(), "/tmp/source".to_string());
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platforms(&["windows"]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: None,
+            nuget: ProjectNugetConfig { sources },
+        };
+
+        let err = render_nuget_config(&project, Path::new("/tmp/nupkgs")).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("conflicts with a generated source")
+        );
+    }
+
+    #[test]
     fn locked_extension_packages_use_exact_versions() {
         let mut extensions = BTreeMap::new();
         extensions.insert("rust_demo".to_string(), "0.2.0".to_string());
@@ -3261,6 +3528,7 @@ mod tests {
             extensions,
             packs: BTreeMap::new(),
             export: None,
+            nuget: ProjectNugetConfig::default(),
         };
 
         assert_eq!(
@@ -3320,6 +3588,7 @@ mod tests {
                 script_encryption_key: Some("0123456789abcdef".to_string()),
                 ..Default::default()
             }),
+            nuget: ProjectNugetConfig::default(),
         };
 
         let (text, presets) = render_export_presets(Path::new("."), &project, None).unwrap();
@@ -3354,6 +3623,7 @@ mod tests {
                 name: Some("Demo".to_string()),
                 ..Default::default()
             }),
+            nuget: ProjectNugetConfig::default(),
         };
 
         let (text, _) = render_export_presets(Path::new("."), &project, None).unwrap();
@@ -3382,6 +3652,7 @@ mod tests {
                 name: Some("Demo".to_string()),
                 ..Default::default()
             }),
+            nuget: ProjectNugetConfig::default(),
         };
         let templates = ExportTemplates {
             custom_template: None,
@@ -3421,6 +3692,7 @@ mod tests {
                 name: Some("Demo".to_string()),
                 ..Default::default()
             }),
+            nuget: ProjectNugetConfig::default(),
         };
         let templates = ExportTemplates {
             custom_template: None,
@@ -3494,6 +3766,7 @@ mod tests {
                 ),
                 ..Default::default()
             }),
+            nuget: ProjectNugetConfig::default(),
         };
 
         let (text, presets) = render_export_presets(dir.path(), &project, None).unwrap();
@@ -3541,6 +3814,7 @@ mod tests {
             extensions: BTreeMap::new(),
             packs,
             export: None,
+            nuget: ProjectNugetConfig::default(),
         };
 
         let err = render_export_presets(dir.path(), &project, None).unwrap_err();
@@ -3564,6 +3838,7 @@ mod tests {
             extensions: BTreeMap::new(),
             packs: BTreeMap::new(),
             export: None,
+            nuget: ProjectNugetConfig::default(),
         };
 
         rewrite_manifest(
