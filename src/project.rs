@@ -929,17 +929,13 @@ fn export_project_target(
     let editor = engine::resolve_editor(opts.with_engine.as_deref())?;
     sync_local_extensions_for_export(cwd, project, target_platform, &editor, mode)?;
     sync_nuget_config(cwd, project, Some(&editor))?;
-    let templates = if opts.with_engine.is_some() {
-        match local_export_templates(project, target_platform, mode) {
-            Ok(templates) => templates,
-            Err(err) => {
-                eprintln!("pug: local export templates unavailable ({err}); downloading templates");
-                download_export_templates(cwd, project, target_platform, mode)?
-            }
-        }
-    } else {
-        download_export_templates(cwd, project, target_platform, mode)?
-    };
+    let templates = resolve_export_templates(
+        cwd,
+        project,
+        target_platform,
+        mode,
+        opts.with_engine.is_some(),
+    )?;
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
     let project_name = if project.name.trim().is_empty() {
@@ -2511,6 +2507,142 @@ fn read_metadata(dir: &Path) -> Result<PackageMetadata> {
     )?)?)
 }
 
+fn resolve_export_templates(
+    cwd: &Path,
+    project: &ProjectConfig,
+    platform_name: &str,
+    mode: ExportMode,
+    prefer_build_output: bool,
+) -> Result<ExportTemplates> {
+    if prefer_build_output {
+        match local_export_templates(project, platform_name, mode) {
+            Ok(templates) => return Ok(templates),
+            Err(err) => {
+                eprintln!(
+                    "pug: local export templates unavailable ({err}); trying installed templates"
+                );
+            }
+        }
+    }
+
+    if let Some(templates) = installed_export_templates(cwd, project, platform_name, mode)? {
+        return Ok(templates);
+    }
+
+    if is_local_engine_tag(&project.engine.tag) {
+        bail!(
+            "local engine tag {} has no installed export template for {} {}; rebuild with `pug engine build --install --template-platform {}`",
+            project.engine.tag,
+            platform_name,
+            mode.template_kind(),
+            platform_name
+        );
+    }
+
+    download_export_templates(cwd, project, platform_name, mode)
+}
+
+fn installed_export_templates(
+    cwd: &Path,
+    project: &ProjectConfig,
+    platform_name: &str,
+    mode: ExportMode,
+) -> Result<Option<ExportTemplates>> {
+    let cfg = Config::load()?;
+    let install_root = cfg.install_dir()?.join(&project.engine.tag);
+    let cache_root = cwd
+        .join(".godot")
+        .join("pug")
+        .join("export_templates")
+        .join(&project.engine.tag);
+
+    if matches!(platform_name, "windows" | "macos" | "linux") {
+        let arch = export_arch_for_platform(project, platform_name)?;
+        let Some(dir) = unpack_installed_template_artifact(
+            &install_root,
+            &cache_root,
+            platform_name,
+            mode.template_kind(),
+            &arch,
+        )?
+        else {
+            return Ok(None);
+        };
+        let template = find_template_file(&dir, mode.template_kind())?;
+        return Ok(Some(ExportTemplates {
+            custom_template: Some(template),
+            android_source_template: None,
+        }));
+    }
+
+    let Some(dir) = unpack_installed_template_artifact(
+        &install_root,
+        &cache_root,
+        platform_name,
+        "template_bundle",
+        "bundle",
+    )?
+    else {
+        return Ok(None);
+    };
+    match platform_name {
+        "android" => Ok(Some(ExportTemplates {
+            custom_template: None,
+            android_source_template: Some(find_named_file(&dir, "android_source.zip")?),
+        })),
+        "ios" => Ok(Some(ExportTemplates {
+            custom_template: Some(find_named_file(&dir, "godot_ios.zip")?),
+            android_source_template: None,
+        })),
+        other => bail!("unsupported export platform: {other}"),
+    }
+}
+
+fn unpack_installed_template_artifact(
+    install_root: &Path,
+    cache_root: &Path,
+    platform_name: &str,
+    kind: &str,
+    arch: &str,
+) -> Result<Option<PathBuf>> {
+    let zip = installed_template_artifact_zip(install_root, platform_name, kind, arch);
+    if !zip.is_file() {
+        return Ok(None);
+    }
+    let unpack = cache_root
+        .join(platform_name)
+        .join(kind)
+        .join(arch)
+        .join("unpack");
+    util::ensure_clean_dir(&unpack)?;
+    util::unzip_to(&zip, &unpack)?;
+    eprintln!(
+        "pug: using installed {} {} template {}",
+        platform_name,
+        kind,
+        zip.display()
+    );
+    Ok(Some(unpack))
+}
+
+fn installed_template_artifact_zip(
+    install_root: &Path,
+    platform_name: &str,
+    kind: &str,
+    arch: &str,
+) -> PathBuf {
+    install_root
+        .join("export_templates")
+        .join(platform_name)
+        .join(kind)
+        .join(arch)
+        .join("artifact.zip")
+}
+
+fn is_local_engine_tag(tag: &str) -> bool {
+    tag.starts_with("local-")
+}
+
 fn local_export_templates(
     project: &ProjectConfig,
     platform_name: &str,
@@ -3762,6 +3894,39 @@ mod tests {
             resolve_local_extension_dir(&project_dir, "local://../extensions/rust_demo").unwrap();
 
         assert_eq!(resolved, ext_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn installed_template_artifact_unpacks_from_engine_install_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_root = dir.path().join("engine");
+        let cache_root = dir
+            .path()
+            .join("project/.godot/pug/export_templates/local-test");
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let template = source.join("godot.windows.template_release.x86_64.mono.exe");
+        fs::write(&template, b"template").unwrap();
+
+        let zip =
+            installed_template_artifact_zip(&install_root, "windows", "template_release", "x86_64");
+        util::zip_paths(&zip, &source, std::slice::from_ref(&template)).unwrap();
+
+        let unpack = unpack_installed_template_artifact(
+            &install_root,
+            &cache_root,
+            "windows",
+            "template_release",
+            "x86_64",
+        )
+        .unwrap()
+        .unwrap();
+
+        let found = find_template_file(&unpack, "template_release").unwrap();
+        assert_eq!(
+            found.file_name().and_then(|name| name.to_str()),
+            Some("godot.windows.template_release.x86_64.mono.exe")
+        );
     }
 
     #[test]

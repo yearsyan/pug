@@ -194,8 +194,30 @@ fn install_built_engine(ctx: &BuildContext, artifacts: &[BuiltArtifact], tag: &s
     let install_dir = cfg.install_dir()?.join(tag);
     util::ensure_clean_dir(&install_dir)?;
     util::unzip_to(&artifact.package_path, &install_dir)?;
+    install_built_template_artifacts(artifacts, &install_dir)?;
     println!("installed {tag} -> {}", install_dir.display());
     Ok(())
+}
+
+fn install_built_template_artifacts(artifacts: &[BuiltArtifact], install_dir: &Path) -> Result<()> {
+    for artifact in artifacts {
+        if artifact.kind == "editor" {
+            continue;
+        }
+        let arch = installed_template_arch(artifact);
+        let dst = install_dir
+            .join("export_templates")
+            .join(&artifact.platform)
+            .join(&artifact.kind)
+            .join(arch)
+            .join("artifact.zip");
+        util::copy_file(&artifact.package_path, &dst)?;
+    }
+    Ok(())
+}
+
+fn installed_template_arch(artifact: &BuiltArtifact) -> &str {
+    artifact.arch.as_deref().unwrap_or("bundle")
 }
 
 fn choose_built_editor_artifact<'a>(
@@ -981,6 +1003,49 @@ mod tests {
         let time = UNIX_EPOCH + std::time::Duration::from_secs(1_777_593_600);
 
         assert_eq!(utc_date_compact(time), "20260501");
+    }
+
+    #[test]
+    fn install_built_template_artifacts_copies_non_editor_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("windows-template_release-x86_64.zip");
+        fs::write(&package, b"template").unwrap();
+        let editor = dir.path().join("editor.zip");
+        fs::write(&editor, b"editor").unwrap();
+        let install_dir = dir.path().join("install");
+        let artifacts = vec![
+            BuiltArtifact {
+                platform: "macos".to_string(),
+                kind: "editor".to_string(),
+                arch: Some("arm64".to_string()),
+                archs: Vec::new(),
+                package_path: editor,
+                sha256: String::new(),
+                size: 0,
+            },
+            BuiltArtifact {
+                platform: "windows".to_string(),
+                kind: "template_release".to_string(),
+                arch: Some("x86_64".to_string()),
+                archs: Vec::new(),
+                package_path: package,
+                sha256: String::new(),
+                size: 0,
+            },
+        ];
+
+        install_built_template_artifacts(&artifacts, &install_dir).unwrap();
+
+        assert!(
+            install_dir
+                .join("export_templates/windows/template_release/x86_64/artifact.zip")
+                .is_file()
+        );
+        assert!(
+            !install_dir
+                .join("export_templates/macos/editor/arm64/artifact.zip")
+                .exists()
+        );
     }
 
     #[test]
