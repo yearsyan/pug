@@ -59,6 +59,8 @@ enum EngineCommands {
 struct EngineBuildArgs {
     #[arg(long)]
     upload: bool,
+    #[arg(long)]
+    install: bool,
     #[arg(long = "template-platform", visible_alias = "template-platforms")]
     template_platforms: Option<String>,
     #[arg(long)]
@@ -69,6 +71,8 @@ struct EngineBuildArgs {
     no_restore: bool,
     #[arg(long)]
     no_log: bool,
+    #[arg(long)]
+    no_remote_sign: bool,
     #[arg(long)]
     force: bool,
     #[arg(last = true)]
@@ -232,11 +236,13 @@ pub fn run() -> Result<()> {
         Commands::Engine { command } => match command {
             EngineCommands::Build(args) => engine::build(engine::EngineBuildOptions {
                 upload: args.upload,
+                install: args.install,
                 template_platforms: args.template_platforms,
                 godot_source: args.godot_source,
                 skip_patches: args.skip_patches,
                 no_restore: args.no_restore,
                 no_log: args.no_log,
+                no_remote_sign: args.no_remote_sign,
                 force: args.force,
                 scons_args: args.scons_args,
             }),

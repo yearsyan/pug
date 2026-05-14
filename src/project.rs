@@ -16,7 +16,7 @@ use crate::{
     api::{ApiClient, DownloadablePackageUploadInit, EngineArtifact, ExportUploadInit},
     config::Config,
     engine,
-    extension::PackageMetadata,
+    extension::{self, PackageMetadata},
     platform, util,
 };
 
@@ -28,6 +28,9 @@ const NUGET_CONFIG_FILE: &str = "NuGet.Config";
 const NUGET_GODOT_SOURCE: &str = "godot-local";
 const NUGET_ORG_SOURCE: &str = "nuget.org";
 const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
+const PROJECT_FILE: &str = "project.pug.json";
+const PROJECT_OVERWRITE_FILE: &str = "project-overwrite.pug.json";
+const LOCAL_EXTENSION_PREFIX: &str = "local://";
 
 fn deserialize_project_version<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -411,7 +414,7 @@ pub struct ProjectExportOptions {
 
 pub fn init(engine_tag: Option<String>, platforms: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let path = cwd.join("project.pug.json");
+    let path = cwd.join(PROJECT_FILE);
     if path.exists() {
         bail!(
             "project.pug.json already exists in this directory.\n       remove it manually if you want to re-initialize."
@@ -457,23 +460,64 @@ pub fn install(package: Option<&str>) -> Result<()> {
         return install_one(&cwd, package);
     }
 
-    let project = read_project(&cwd)?;
-    let packages = locked_extension_packages(&project);
-    if packages.is_empty() {
+    let mut project = read_project(&cwd)?;
+    if project.extensions.is_empty() {
         sync_nuget_config(&cwd, &project, None)?;
         sync_export_presets(&cwd, &project, None)?;
         println!("no extensions listed in project.pug.json");
         return Ok(());
     }
-    for package in packages {
-        install_one(&cwd, &package)?;
+    let platforms = export_platforms(&project)?;
+    let mut base_project = read_project_base(&cwd)?;
+    let mut base_changed = false;
+    let mut local_editor = None;
+    for (name, value) in project.extensions.clone() {
+        if is_local_extension_ref(&value) {
+            let editor = match &local_editor {
+                Some(editor) => editor,
+                None => {
+                    local_editor = Some(engine::resolve_editor(None)?);
+                    local_editor.as_ref().unwrap()
+                }
+            };
+            install_local_extension(&cwd, &project, &name, &value, &platforms, editor, false)?;
+        } else {
+            let requested_version = nonempty_version(&value);
+            let installed =
+                install_remote_extension(&cwd, &project, &name, requested_version.as_deref())?;
+            finalize_extension_install(
+                &cwd,
+                &name,
+                &project,
+                &installed.template_text,
+                &platforms,
+            )?;
+            if base_project
+                .extensions
+                .get(&name)
+                .is_some_and(|value| !is_local_extension_ref(value) && value != &installed.version)
+            {
+                base_project
+                    .extensions
+                    .insert(name.clone(), installed.version.clone());
+                base_changed = true;
+            }
+            println!("installed {name}@{}", installed.version);
+        }
     }
+    if base_changed {
+        write_project(&cwd, &base_project)?;
+        project = read_project(&cwd)?;
+    }
+    update_gitignore(&cwd)?;
+    sync_nuget_config(&cwd, &project, None)?;
+    sync_export_presets(&cwd, &project, None)?;
     Ok(())
 }
 
 pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut project = read_project(&cwd)?;
+    let mut project = read_project_base(&cwd)?;
     let name = normalize_pack_name(name)?;
     let path = normalize_pack_path(path)?;
     let encrypt_type = parse_pack_encrypt_type(encrypt_type)?;
@@ -491,6 +535,7 @@ pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> 
         },
     );
     write_project(&cwd, &project)?;
+    let project = read_project(&cwd)?;
     sync_export_presets(&cwd, &project, None)?;
     println!(
         "registered pack {name} ({}) in project.pug.json",
@@ -500,8 +545,54 @@ pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> 
 }
 
 fn install_one(cwd: &Path, package: &str) -> Result<()> {
-    let mut project = read_project(&cwd)?;
+    let mut project = read_project_base(cwd)?;
     let (name, requested_version) = parse_package(package)?;
+    if let Some(local_ref) = requested_version
+        .as_deref()
+        .filter(|value| is_local_extension_ref(value))
+    {
+        project
+            .extensions
+            .insert(name.clone(), local_ref.to_string());
+        write_project(cwd, &project)?;
+        let project = read_project(cwd)?;
+        let platforms = export_platforms(&project)?;
+        let editor = engine::resolve_editor(None)?;
+        install_local_extension(cwd, &project, &name, local_ref, &platforms, &editor, false)?;
+        update_gitignore(cwd)?;
+        sync_nuget_config(cwd, &project, None)?;
+        sync_export_presets(cwd, &project, None)?;
+        return Ok(());
+    }
+
+    let effective_project = read_project(cwd)?;
+    let installed =
+        install_remote_extension(cwd, &effective_project, &name, requested_version.as_deref())?;
+    project
+        .extensions
+        .insert(name.clone(), installed.version.clone());
+    write_project(cwd, &project)?;
+    let project = read_project(cwd)?;
+    let platforms = export_platforms(&project)?;
+    finalize_extension_install(cwd, &name, &project, &installed.template_text, &platforms)?;
+    update_gitignore(cwd)?;
+    sync_nuget_config(cwd, &project, None)?;
+    sync_export_presets(cwd, &project, None)?;
+    println!("installed {package}");
+    Ok(())
+}
+
+struct InstalledExtension {
+    version: String,
+    template_text: String,
+}
+
+fn install_remote_extension(
+    cwd: &Path,
+    project: &ProjectConfig,
+    name: &str,
+    requested_version: Option<&str>,
+) -> Result<InstalledExtension> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
     let project_name = if project.name.trim().is_empty() {
@@ -518,13 +609,13 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     let mut installed_version = None;
     let mut template_text = None;
 
-    for platform_name in export_platforms(&project)? {
-        for arch in extension_arches_for_platform(&project, &platform_name)? {
+    for platform_name in export_platforms(project)? {
+        for arch in extension_arches_for_platform(project, &platform_name)? {
             let target = platform::spec(&platform_name, &arch)?;
             let resolved = api.resolve_extension(
                 &project_name,
                 &name,
-                requested_version.as_deref(),
+                requested_version,
                 &target.platform,
                 &target.arch,
             )?;
@@ -619,18 +710,182 @@ fn install_one(cwd: &Path, package: &str) -> Result<()> {
     }
 
     let version = installed_version.context("no platform artifacts installed")?;
-    project.extensions.insert(name.clone(), version);
-    write_project(&cwd, &project)?;
     let template_text = template_text.unwrap_or_else(default_template);
-    rewrite_manifest(&cwd, &name, &project, &template_text)?;
-    update_extension_list(&cwd, &name)?;
-    update_gitignore(&cwd)?;
-    sync_nuget_config(cwd, &project, None)?;
-    sync_export_presets(&cwd, &project, None)?;
-    println!("installed {package}");
+    Ok(InstalledExtension {
+        version,
+        template_text,
+    })
+}
+
+fn install_local_extension(
+    cwd: &Path,
+    project: &ProjectConfig,
+    name: &str,
+    value: &str,
+    platforms: &[String],
+    editor: &Path,
+    debug: bool,
+) -> Result<()> {
+    let ext_dir = resolve_local_extension_dir(cwd, value)?;
+    let targets = extension_targets_for_platforms(project, platforms)?;
+    let built = extension::build_local(&ext_dir, targets, editor, debug)
+        .with_context(|| format!("build local extension {name} from {}", ext_dir.display()))?;
+    if built.is_empty() {
+        bail!("local extension {name} did not produce any artifacts");
+    }
+    if let Some(actual) = built
+        .iter()
+        .map(|item| item.name.as_str())
+        .find(|actual| *actual != name)
+    {
+        bail!(
+            "local extension dependency {name} points to package {}, expected Cargo.toml package.name to match",
+            actual
+        );
+    }
+
+    let mut template_text = None;
+    for item in &built {
+        let tmp = tempfile::tempdir()?;
+        let unpack = tmp.path().join("unpack");
+        util::untar_zst(&item.package_path, &unpack)?;
+        let metadata = read_metadata(&unpack)?;
+        if metadata.name != name
+            || metadata.platform != item.target.platform
+            || metadata.arch != item.target.arch
+        {
+            bail!(
+                "local extension package metadata mismatch for {name}: {} {}:{}",
+                metadata.name,
+                metadata.platform,
+                metadata.arch
+            );
+        }
+        let lib_src = unpack.join(&metadata.library);
+        let lib_sha = util::sha256_file(&lib_src)?;
+        if lib_sha != metadata.lib_sha256 {
+            bail!(
+                "local extension library sha mismatch for {name}: got {lib_sha} want {}",
+                metadata.lib_sha256
+            );
+        }
+        let lib_size = util::file_size(&lib_src)?;
+        if lib_size != metadata.lib_size {
+            bail!(
+                "local extension library size mismatch for {name}: got {lib_size} want {}",
+                metadata.lib_size
+            );
+        }
+        let lib_dst = cwd
+            .join("bin")
+            .join(name)
+            .join(&item.target.platform)
+            .join(&item.target.arch)
+            .join(&metadata.library);
+        util::copy_file(&lib_src, &lib_dst)?;
+
+        let tmpl = unpack.join(format!("{name}.gdextension.tmpl"));
+        if tmpl.is_file() {
+            template_text = Some(fs::read_to_string(&tmpl)?);
+            util::copy_file(
+                &tmpl,
+                &cwd.join("bin")
+                    .join(name)
+                    .join(format!("{name}.gdextension.tmpl")),
+            )?;
+        }
+    }
+
+    let template_text = template_text.unwrap_or_else(default_template);
+    finalize_extension_install(cwd, name, project, &template_text, platforms)?;
+    println!("installed {name}@{value}");
     Ok(())
 }
 
+fn finalize_extension_install(
+    cwd: &Path,
+    name: &str,
+    project: &ProjectConfig,
+    template_text: &str,
+    platforms: &[String],
+) -> Result<()> {
+    rewrite_manifest_for_platforms(cwd, name, project, template_text, platforms)?;
+    update_extension_list(cwd, name)?;
+    Ok(())
+}
+
+fn resolve_local_extension_dir(cwd: &Path, value: &str) -> Result<PathBuf> {
+    let value = value.trim();
+    let rest = value
+        .strip_prefix(LOCAL_EXTENSION_PREFIX)
+        .context("local extension dependency must start with local://")?;
+    if rest.trim().is_empty() {
+        bail!("local extension path must not be empty");
+    }
+    let path = PathBuf::from(rest);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize()
+        .with_context(|| format!("resolve local extension path {}", path.display()))
+}
+
+fn is_local_extension_ref(value: &str) -> bool {
+    value.trim().starts_with(LOCAL_EXTENSION_PREFIX)
+}
+
+fn nonempty_version(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extension_targets_for_platforms(
+    project: &ProjectConfig,
+    platforms: &[String],
+) -> Result<Vec<platform::TargetSpec>> {
+    let capable = platform::host_capable_platforms()?;
+    let mut targets = Vec::new();
+    for platform_name in platforms {
+        if !capable.iter().any(|capable| capable == platform_name) {
+            bail!(
+                "local extension platform {platform_name} is not buildable on this host; supported here: {}",
+                capable.join(",")
+            );
+        }
+        for arch in extension_arches_for_platform(project, platform_name)? {
+            targets.push(platform::spec(platform_name, &arch)?);
+        }
+    }
+    Ok(targets)
+}
+
+fn sync_local_extensions_for_export(
+    cwd: &Path,
+    project: &ProjectConfig,
+    target_platform: &str,
+    editor: &Path,
+    mode: ExportMode,
+) -> Result<()> {
+    let platforms = vec![target_platform.to_string()];
+    for (name, value) in &project.extensions {
+        if is_local_extension_ref(value) {
+            install_local_extension(
+                cwd,
+                project,
+                name,
+                value,
+                &platforms,
+                editor,
+                mode == ExportMode::Debug,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn locked_extension_packages(project: &ProjectConfig) -> Vec<String> {
     project
         .extensions
@@ -672,6 +927,7 @@ fn export_project_target(
     }
 
     let editor = engine::resolve_editor(opts.with_engine.as_deref())?;
+    sync_local_extensions_for_export(cwd, project, target_platform, &editor, mode)?;
     sync_nuget_config(cwd, project, Some(&editor))?;
     let templates = if opts.with_engine.is_some() {
         match local_export_templates(project, target_platform, mode) {
@@ -1037,16 +1293,57 @@ struct ExportTemplateOverride<'a> {
 }
 
 fn read_project(cwd: &Path) -> Result<ProjectConfig> {
-    let path = cwd.join("project.pug.json");
-    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut value = read_project_value(&cwd.join(PROJECT_FILE))?;
+    let overwrite_path = cwd.join(PROJECT_OVERWRITE_FILE);
+    if overwrite_path.is_file() {
+        let overwrite = read_project_value(&overwrite_path)?;
+        merge_json_value(&mut value, overwrite);
+    }
+    let mut project: ProjectConfig = serde_json::from_value(value)
+        .with_context(|| format!("parse {}", cwd.join(PROJECT_FILE).display()))?;
+    migrate_legacy_export_platforms(&mut project)?;
+    Ok(project)
+}
+
+fn read_project_base(cwd: &Path) -> Result<ProjectConfig> {
     let mut project: ProjectConfig =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_value(read_project_value(&cwd.join(PROJECT_FILE))?)
+            .with_context(|| format!("parse {}", cwd.join(PROJECT_FILE).display()))?;
     migrate_legacy_export_platforms(&mut project)?;
     Ok(project)
 }
 
 fn write_project(cwd: &Path, project: &ProjectConfig) -> Result<()> {
-    util::write_json(&cwd.join("project.pug.json"), project)
+    util::write_json(&cwd.join(PROJECT_FILE), project)
+}
+
+fn read_project_value(path: &Path) -> Result<Value> {
+    let value: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if !value.is_object() {
+        bail!("{} must contain a JSON object", path.display());
+    }
+    Ok(value)
+}
+
+fn merge_json_value(base: &mut Value, overwrite: Value) {
+    match (base, overwrite) {
+        (Value::Object(base), Value::Object(overwrite)) => {
+            for (key, value) in overwrite {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_json_value(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overwrite) => {
+            *base = overwrite;
+        }
+    }
 }
 
 fn migrate_legacy_export_platforms(project: &mut ProjectConfig) -> Result<()> {
@@ -2457,17 +2754,29 @@ fn find_file_by(dir: &Path, predicate: &dyn Fn(&Path) -> bool) -> Option<PathBuf
     None
 }
 
+#[cfg(test)]
 fn rewrite_manifest(
     cwd: &Path,
     name: &str,
     project: &ProjectConfig,
     template_text: &str,
 ) -> Result<()> {
+    let platforms = export_platforms(project)?;
+    rewrite_manifest_for_platforms(cwd, name, project, template_text, &platforms)
+}
+
+fn rewrite_manifest_for_platforms(
+    cwd: &Path,
+    name: &str,
+    project: &ProjectConfig,
+    template_text: &str,
+    platforms: &[String],
+) -> Result<()> {
     let mut text = strip_libraries(template_text);
     text.push_str("\n[libraries]\n");
-    for platform_name in export_platforms(project)? {
-        for arch in extension_arches_for_platform(project, &platform_name)? {
-            let target = platform::spec(&platform_name, &arch)?;
+    for platform_name in platforms {
+        for arch in extension_arches_for_platform(project, platform_name)? {
+            let target = platform::spec(platform_name, &arch)?;
             let lib = find_installed_lib(cwd, name, &target.platform, &target.arch)?;
             let rel = format!(
                 "res://bin/{}/{}/{}/{}",
@@ -3261,7 +3570,15 @@ fn upsert_editor_setting(mut text: String, key: &str, value: &Path) -> String {
 }
 
 fn update_gitignore(cwd: &Path) -> Result<()> {
-    update_gitignore_entries(cwd, &["bin/", "export_presets.cfg", ".godot/pug/"])
+    update_gitignore_entries(
+        cwd,
+        &[
+            "bin/",
+            "export_presets.cfg",
+            ".godot/pug/",
+            PROJECT_OVERWRITE_FILE,
+        ],
+    )
 }
 
 fn update_gitignore_entries(cwd: &Path, entries: &[&str]) -> Result<()> {
@@ -3389,6 +3706,62 @@ mod tests {
             android_enabled_arches(&object_project).unwrap(),
             BTreeSet::from(["arm64-v8a".to_string()])
         );
+    }
+
+    #[test]
+    fn read_project_merges_overwrite_file_recursively() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PROJECT_FILE),
+            r#"{
+                "name":"demo",
+                "engine":{"tag":"stable"},
+                "platforms":["android"],
+                "extensions":{"netcode":"1.0.0","rust_demo":"0.2.4"}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(PROJECT_OVERWRITE_FILE),
+            r#"{
+                "engine":{"tag":"local-20260514-test"},
+                "extensions":{"rust_demo":"local://../extensions/rust_demo"}
+            }"#,
+        )
+        .unwrap();
+
+        let project = read_project(dir.path()).unwrap();
+
+        assert_eq!(project.engine.tag, "local-20260514-test");
+        assert_eq!(
+            project.extensions.get("rust_demo").unwrap(),
+            "local://../extensions/rust_demo"
+        );
+        assert_eq!(project.extensions.get("netcode").unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn update_gitignore_includes_project_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+
+        update_gitignore(dir.path()).unwrap();
+
+        let text = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(text.lines().any(|line| line == PROJECT_OVERWRITE_FILE));
+    }
+
+    #[test]
+    fn local_extension_ref_resolves_relative_to_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("game");
+        let ext_dir = dir.path().join("extensions/rust_demo");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::create_dir_all(&ext_dir).unwrap();
+
+        let resolved =
+            resolve_local_extension_dir(&project_dir, "local://../extensions/rust_demo").unwrap();
+
+        assert_eq!(resolved, ext_dir.canonicalize().unwrap());
     }
 
     #[test]

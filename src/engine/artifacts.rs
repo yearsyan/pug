@@ -134,7 +134,7 @@ pub(super) fn upload_engine_artifacts(
     ctx: &BuildContext,
     artifacts: &[BuiltArtifact],
     force: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
     let project_name = ctx
@@ -156,12 +156,17 @@ pub(super) fn upload_engine_artifacts(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|id| *id > 0);
     let existing = if use_dev_tag {
-        Vec::new()
+        None
     } else {
         existing_engine_artifacts(&api, project_name, &repo_commit, &engine_commit)?
     };
+    let mut engine_tag = existing.as_ref().map(|existing| existing.tag.clone());
     for artifact in artifacts {
-        if let Some(remote) = existing
+        let existing_artifacts = existing
+            .as_ref()
+            .map(|existing| existing.artifacts.as_slice())
+            .unwrap_or(&[]);
+        if let Some(remote) = existing_artifacts
             .iter()
             .find(|remote| same_engine_artifact_slot(remote, artifact))
         {
@@ -202,6 +207,9 @@ pub(super) fn upload_engine_artifacts(
         })?;
         api.put_file(&init, &artifact.package_path)?;
         let complete = api.engine_upload_complete(&init.upload_id)?;
+        if let Some(tag) = complete.engine_tag.as_ref().or(init.engine_tag.as_ref()) {
+            record_engine_tag(&mut engine_tag, tag)?;
+        }
         println!(
             "uploaded {} {} {:?} -> {} status={} key={}",
             artifact.platform,
@@ -212,7 +220,12 @@ pub(super) fn upload_engine_artifacts(
             init.s3_key
         );
     }
-    Ok(())
+    Ok(engine_tag)
+}
+
+struct ExistingEngineArtifacts {
+    tag: String,
+    artifacts: Vec<RemoteEngineArtifact>,
 }
 
 fn existing_engine_artifacts(
@@ -220,16 +233,31 @@ fn existing_engine_artifacts(
     project_name: &str,
     repo_commit: &str,
     engine_commit: &str,
-) -> Result<Vec<RemoteEngineArtifact>> {
+) -> Result<Option<ExistingEngineArtifacts>> {
     let tags = api.engine_tags_for_project(project_name)?;
     let Some(tag) = tags
         .tags
         .into_iter()
         .find(|tag| tag.repo_commit == repo_commit && tag.engine_commit == engine_commit)
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
-    Ok(api.engine_download(project_name, &tag.tag)?.artifacts)
+    let tag_name = tag.tag;
+    Ok(Some(ExistingEngineArtifacts {
+        artifacts: api.engine_download(project_name, &tag_name)?.artifacts,
+        tag: tag_name,
+    }))
+}
+
+fn record_engine_tag(current: &mut Option<String>, next: &str) -> Result<()> {
+    if let Some(current) = current {
+        if current != next {
+            bail!("pannel returned inconsistent engine tags: {current} and {next}");
+        }
+    } else {
+        *current = Some(next.to_string());
+    }
+    Ok(())
 }
 
 fn same_engine_artifact_slot(remote: &RemoteEngineArtifact, local: &BuiltArtifact) -> bool {

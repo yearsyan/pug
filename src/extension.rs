@@ -45,14 +45,14 @@ pub struct PackageMetadata {
 }
 
 #[derive(Debug)]
-struct BuiltExtension {
-    name: String,
+pub(crate) struct BuiltExtension {
+    pub(crate) name: String,
     version: String,
-    target: TargetSpec,
-    lib_path: PathBuf,
+    pub(crate) target: TargetSpec,
+    pub(crate) lib_path: PathBuf,
     lib_sha256: String,
     lib_size: i64,
-    package_path: PathBuf,
+    pub(crate) package_path: PathBuf,
     package_sha256: String,
     package_size: i64,
 }
@@ -100,7 +100,6 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
     )?;
     let version = version_plan.version.clone();
     validate_upload_version(&version)?;
-    let profile = if debug { "debug" } else { "release" };
     let targets = resolve_targets(platform.as_deref())?;
     let editor = if with_engine.is_some() {
         engine::resolve_editor(with_engine.as_deref())?
@@ -109,22 +108,7 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
     } else {
         engine::resolve_editor(None)?
     };
-    let mut built = Vec::new();
-    for target in targets {
-        let lib_path = build_one(&ext_dir, &name, &target, profile, &editor)?;
-        let package_path = package_extension(&ext_dir, &name, &version, &target, &lib_path)?;
-        built.push(BuiltExtension {
-            name: name.clone(),
-            version: version.clone(),
-            target,
-            lib_sha256: util::sha256_file(&lib_path)?,
-            lib_size: util::file_size(&lib_path)?,
-            package_sha256: util::sha256_file(&package_path)?,
-            package_size: util::file_size(&package_path)?,
-            lib_path,
-            package_path,
-        });
-    }
+    let built = build_targets(&ext_dir, &name, &version, targets, &editor, debug)?;
 
     for item in &built {
         println!(
@@ -146,6 +130,44 @@ pub fn build(opts: ExtensionBuildOptions) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(crate) fn build_local(
+    ext_dir: &Path,
+    targets: Vec<TargetSpec>,
+    editor: &Path,
+    debug: bool,
+) -> Result<Vec<BuiltExtension>> {
+    let (name, version) = cargo_package(ext_dir)?;
+    build_targets(ext_dir, &name, &version, targets, editor, debug)
+}
+
+fn build_targets(
+    ext_dir: &Path,
+    name: &str,
+    version: &str,
+    targets: Vec<TargetSpec>,
+    editor: &Path,
+    debug: bool,
+) -> Result<Vec<BuiltExtension>> {
+    let profile = if debug { "debug" } else { "release" };
+    let mut built = Vec::new();
+    for target in targets {
+        let lib_path = build_one(ext_dir, name, &target, profile, editor)?;
+        let package_path = package_extension(ext_dir, name, version, &target, &lib_path)?;
+        built.push(BuiltExtension {
+            name: name.to_string(),
+            version: version.to_string(),
+            target,
+            lib_sha256: util::sha256_file(&lib_path)?,
+            lib_size: util::file_size(&lib_path)?,
+            package_sha256: util::sha256_file(&package_path)?,
+            package_size: util::file_size(&package_path)?,
+            lib_path,
+            package_path,
+        });
+    }
+    Ok(built)
 }
 
 pub fn list(remote_only: bool) -> Result<()> {

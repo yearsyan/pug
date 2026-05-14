@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use inquire::Select;
+use rand::{Rng, distr::Alphanumeric};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -8,6 +9,7 @@ use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -28,7 +30,7 @@ use artifacts::{package_engine_artifacts, upload_engine_artifacts};
 use binaries::{choose_preferred_binary, find_matching_binary, matching_binaries};
 #[cfg(test)]
 use model::{ArchSection, TemplateTarget};
-use model::{BuildContext, ProjectJson, editor_output_dir};
+use model::{BuildContext, BuiltArtifact, ProjectJson, editor_output_dir};
 pub use source::find_repo_root;
 use source::{
     apply_patches, find_repo_root_from, force_restore_godot_source, godot_tag, prepare_splash,
@@ -47,11 +49,13 @@ const NO_LOG_CPPDEFINE: &str = "GODOT_CUSTOM_NO_LOG";
 
 pub struct EngineBuildOptions {
     pub upload: bool,
+    pub install: bool,
     pub template_platforms: Option<String>,
     pub godot_source: Option<PathBuf>,
     pub skip_patches: bool,
     pub no_restore: bool,
     pub no_log: bool,
+    pub no_remote_sign: bool,
     pub force: bool,
     pub scons_args: Vec<String>,
 }
@@ -86,9 +90,21 @@ pub fn build(opts: EngineBuildOptions) -> Result<()> {
         build_editor(&ctx)?;
         build_templates(&ctx)?;
 
-        if opts.upload {
+        if opts.upload || opts.install {
             let artifacts = package_engine_artifacts(&ctx)?;
-            upload_engine_artifacts(&ctx, &artifacts, opts.force)?;
+            let remote_tag = if opts.upload {
+                upload_engine_artifacts(&ctx, &artifacts, opts.force)?
+            } else {
+                None
+            };
+            if opts.install {
+                let tag = if opts.upload {
+                    remote_tag.context("pannel did not return an engine tag for uploaded build")?
+                } else {
+                    make_local_engine_tag()
+                };
+                install_built_engine(&ctx, &artifacts, &tag)?;
+            }
         }
         Ok(())
     })();
@@ -170,6 +186,67 @@ pub fn install(tag: Option<String>, download_only: bool) -> Result<()> {
     util::unzip_to(&zip, &install_dir)?;
     println!("installed {} -> {}", response.tag, install_dir.display());
     Ok(())
+}
+
+fn install_built_engine(ctx: &BuildContext, artifacts: &[BuiltArtifact], tag: &str) -> Result<()> {
+    let artifact = choose_built_editor_artifact(ctx, artifacts)?;
+    let cfg = Config::load()?;
+    let install_dir = cfg.install_dir()?.join(tag);
+    util::ensure_clean_dir(&install_dir)?;
+    util::unzip_to(&artifact.package_path, &install_dir)?;
+    println!("installed {tag} -> {}", install_dir.display());
+    Ok(())
+}
+
+fn choose_built_editor_artifact<'a>(
+    ctx: &BuildContext,
+    artifacts: &'a [BuiltArtifact],
+) -> Result<&'a BuiltArtifact> {
+    artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.kind == "editor"
+                && artifact.platform == ctx.host_api
+                && artifact.arch.as_deref() == Some(ctx.host_arch)
+        })
+        .or_else(|| {
+            artifacts
+                .iter()
+                .find(|artifact| artifact.kind == "editor" && artifact.platform == ctx.host_api)
+        })
+        .context("built artifacts did not include a matching editor")
+}
+
+fn make_local_engine_tag() -> String {
+    let date = utc_date_compact(SystemTime::now());
+    let mut rng = rand::rng();
+    let suffix: String = (0..8)
+        .map(|_| char::from(rng.sample(Alphanumeric)))
+        .collect();
+    format!("local-{date}-{suffix}")
+}
+
+fn utc_date_compact(time: SystemTime) -> String {
+    let days = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or_default() as i64;
+    let (year, month, day) = civil_from_unix_days(days);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
 }
 
 pub fn use_tag(tag: Option<&str>) -> Result<()> {
@@ -316,7 +393,8 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
     let host_godot = platform::host_godot_platform()?;
     let host_arch = platform::host_arch();
     let template_targets = resolve_template_targets(&project, opts.template_platforms.as_deref())?;
-    let manifest_public_key_path = prepare_manifest_public_key(&repo_root, &project)?;
+    let manifest_public_key_path =
+        prepare_manifest_public_key(&repo_root, &project, opts.upload, opts.no_remote_sign)?;
     Ok(BuildContext {
         repo_root,
         godot_src,
@@ -330,17 +408,39 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
     })
 }
 
-fn prepare_manifest_public_key(repo_root: &Path, project: &ProjectJson) -> Result<Option<PathBuf>> {
+fn prepare_manifest_public_key(
+    repo_root: &Path,
+    project: &ProjectJson,
+    upload: bool,
+    no_remote_sign: bool,
+) -> Result<Option<PathBuf>> {
     if !integrity_signing_enabled(project) {
+        return Ok(None);
+    }
+    if no_remote_sign {
+        eprintln!(
+            "warning: --no-remote-sign set; engine build will not embed pannel manifest public key"
+        );
         return Ok(None);
     }
 
     let project_name = resolve_build_project_name(project)?;
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
-    let response = api
-        .manifest_public_key(&project_name)
-        .with_context(|| format!("fetch manifest public key for pannel project {project_name}"))?;
+    let response = match api.manifest_public_key(&project_name) {
+        Ok(response) => response,
+        Err(err) if !upload => {
+            eprintln!(
+                "warning: failed to fetch pannel manifest public key for project {project_name}; continuing unsigned because this build is not uploading: {err}"
+            );
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("fetch manifest public key for pannel project {project_name}")
+            });
+        }
+    };
     let public_key_pem = normalize_pem(&response.manifest_public_key_pem);
     if public_key_pem.is_empty() {
         bail!("pannel project {project_name} does not have a manifest public key configured");
@@ -744,16 +844,40 @@ fn find_editor_in_dir(dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn read_project_engine_tag() -> Result<Option<String>> {
-    let path = std::env::current_dir()?.join("project.pug.json");
+    let cwd = std::env::current_dir()?;
+    let path = cwd.join("project.pug.json");
     if !path.is_file() {
         return Ok(None);
     }
-    let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let overwrite_path = cwd.join("project-overwrite.pug.json");
+    if overwrite_path.is_file() {
+        let overwrite: Value = serde_json::from_slice(&fs::read(overwrite_path)?)?;
+        merge_json_value(&mut value, overwrite);
+    }
     Ok(value
         .get("engine")
         .and_then(|e| e.get("tag"))
         .and_then(Value::as_str)
         .map(str::to_string))
+}
+
+fn merge_json_value(base: &mut Value, overwrite: Value) {
+    match (base, overwrite) {
+        (Value::Object(base), Value::Object(overwrite)) => {
+            for (key, value) in overwrite {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_json_value(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overwrite) => {
+            *base = overwrite;
+        }
+    }
 }
 
 pub(crate) fn resolve_project_name() -> Result<String> {
@@ -801,7 +925,8 @@ fn project_name_in_dir(dir: &Path) -> Result<Option<String>> {
 
 fn existing_file(path: &Path) -> Result<PathBuf> {
     if path.is_file() {
-        Ok(path.to_path_buf())
+        path.canonicalize()
+            .with_context(|| format!("resolve {}", path.display()))
     } else {
         bail!("file does not exist: {}", path.display())
     }
@@ -849,6 +974,13 @@ mod tests {
         let (full, short) = godot_version(dir.path()).unwrap();
         assert_eq!(full, "4.6.2-stable");
         assert_eq!(short, "406");
+    }
+
+    #[test]
+    fn local_engine_tag_date_uses_compact_utc_day() {
+        let time = UNIX_EPOCH + std::time::Duration::from_secs(1_777_593_600);
+
+        assert_eq!(utc_date_compact(time), "20260501");
     }
 
     #[test]
