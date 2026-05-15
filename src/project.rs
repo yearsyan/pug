@@ -31,6 +31,8 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 const PROJECT_FILE: &str = "project.pug.json";
 const PROJECT_OVERWRITE_FILE: &str = "project-overwrite.pug.json";
 const LOCAL_EXTENSION_PREFIX: &str = "local://";
+const ALWAYS_MAIN_PACK_EXCLUDE_FILTERS: &[&str] = &["project*.pug.json"];
+const RELEASE_MAIN_PACK_EXCLUDE_FILTERS: &[&str] = &["*.cs", "*.cs.uid"];
 
 fn deserialize_project_version<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -1525,7 +1527,10 @@ fn render_export_presets(
         let index = presets.len();
         let preset_name = preset_platform_name(platform_name)?;
         let export_path = export_path_for_platform(project, platform_name, &display_name)?;
-        let main_exclude_filter = main_pack_exclude_filter(project, platform_name)?;
+        let mode = template_override
+            .filter(|template_override| template_override.platform == platform_name.as_str())
+            .map(|template_override| template_override.mode);
+        let main_exclude_filter = main_pack_exclude_filter(project, platform_name, mode)?;
         text.push_str(&format!("[preset.{index}]\n"));
         text.push_str(&format!("name={}\n", cfg_string(preset_name)));
         text.push_str(&format!("platform={}\n", cfg_string(preset_name)));
@@ -1669,8 +1674,22 @@ fn pack_needs_separate_pck(platform_name: &str, pack: &ProjectPackConfig) -> boo
     }
 }
 
-fn main_pack_exclude_filter(project: &ProjectConfig, platform_name: &str) -> Result<String> {
-    let mut filters = Vec::new();
+fn main_pack_exclude_filter(
+    project: &ProjectConfig,
+    platform_name: &str,
+    mode: Option<ExportMode>,
+) -> Result<String> {
+    let mut filters = ALWAYS_MAIN_PACK_EXCLUDE_FILTERS
+        .iter()
+        .map(|filter| (*filter).to_string())
+        .collect::<Vec<_>>();
+    if mode == Some(ExportMode::Release) {
+        filters.extend(
+            RELEASE_MAIN_PACK_EXCLUDE_FILTERS
+                .iter()
+                .map(|filter| (*filter).to_string()),
+        );
+    }
     for (name, pack) in &project.packs {
         let should_exclude = match pack.kind {
             ProjectPackKind::Downloadable => true,
@@ -4167,6 +4186,71 @@ mod tests {
         let (text, _) = render_export_presets(Path::new("."), &project, None).unwrap();
 
         assert!(text.contains("dotnet/include_debug_symbols=false"));
+        assert!(text.contains("exclude_filter=\"project*.pug.json\""));
+        assert!(!text.contains("*.cs,*.cs.uid"));
+    }
+
+    #[test]
+    fn export_presets_release_excludes_csharp_placeholder_entries() {
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![("windows", ProjectPlatformConfig::default())]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+            nuget: ProjectNugetConfig::default(),
+        };
+        let templates = ExportTemplates::default();
+        let template_override = ExportTemplateOverride {
+            platform: "windows",
+            mode: ExportMode::Release,
+            templates: &templates,
+            android_keystore: None,
+        };
+
+        let (text, _) =
+            render_export_presets(Path::new("."), &project, Some(&template_override)).unwrap();
+
+        assert!(text.contains("exclude_filter=\"project*.pug.json,*.cs,*.cs.uid\""));
+    }
+
+    #[test]
+    fn export_presets_debug_keeps_csharp_placeholder_entries() {
+        let project = ProjectConfig {
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            engine: ProjectEngine {
+                tag: "test".to_string(),
+            },
+            platforms: test_platform_configs(vec![("windows", ProjectPlatformConfig::default())]),
+            extensions: BTreeMap::new(),
+            packs: BTreeMap::new(),
+            export: Some(ProjectExportConfig {
+                name: Some("Demo".to_string()),
+                ..Default::default()
+            }),
+            nuget: ProjectNugetConfig::default(),
+        };
+        let templates = ExportTemplates::default();
+        let template_override = ExportTemplateOverride {
+            platform: "windows",
+            mode: ExportMode::Debug,
+            templates: &templates,
+            android_keystore: None,
+        };
+
+        let (text, _) =
+            render_export_presets(Path::new("."), &project, Some(&template_override)).unwrap();
+
+        assert!(text.contains("exclude_filter=\"project*.pug.json\""));
+        assert!(!text.contains("*.cs,*.cs.uid"));
     }
 
     #[test]
@@ -4316,9 +4400,9 @@ mod tests {
         assert!(text.contains("export_filter=\"selected_resources\""));
         assert!(text.contains("res://packs/dl/level.tscn"));
         assert!(text.contains("res://packs/internal/shared.tres"));
-        assert!(text.contains("exclude_filter=\"packs/dl/*,packs/dl/**\""));
+        assert!(text.contains("exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**\""));
         assert!(text.contains(
-            "exclude_filter=\"packs/dl/*,packs/dl/**,packs/internal/*,packs/internal/**\""
+            "exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**,packs/internal/*,packs/internal/**\""
         ));
 
         let random = presets
