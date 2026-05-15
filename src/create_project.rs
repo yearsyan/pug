@@ -7,6 +7,7 @@ use crate::util;
 
 const DEFAULT_GODOT_TAG: &str = "4.6.2-stable";
 const DEFAULT_PLATFORMS: [&str; 3] = ["macos:arm64", "android:arm64", "windows:x86_64"];
+const ENGINE_BUILD_WORKFLOW: &str = ".gitea/workflows/pug-engine-build.yml";
 const APP_EXPORT_WORKFLOW: &str = ".gitea/workflows/pug-app-export.yml";
 const EXTENSION_BUILD_WORKFLOW: &str = ".gitea/workflows/pug-extension-build.yml";
 const GITATTRIBUTES: &str = ".gitattributes";
@@ -180,6 +181,7 @@ fn copy_template_dirs(
     clone_template(template, &clone_dir, checkout)?;
     copy_template_dir(&clone_dir, project_dir, "modules")?;
     copy_template_dir(&clone_dir, project_dir, "patches")?;
+    copy_template_file(&clone_dir, project_dir, ENGINE_BUILD_WORKFLOW)?;
     copy_template_file(&clone_dir, project_dir, APP_EXPORT_WORKFLOW)?;
     copy_template_file(&clone_dir, project_dir, EXTENSION_BUILD_WORKFLOW)?;
     copy_template_file(&clone_dir, project_dir, GITATTRIBUTES)?;
@@ -341,6 +343,11 @@ mod tests {
         fs::write(template.join("patches/001-test/description.md"), "# test\n").unwrap();
         fs::write(template.join(".gitattributes"), "* text=auto eol=lf\n").unwrap();
         fs::write(
+            template.join(".gitea/workflows/pug-engine-build.yml"),
+            "name: engine\n",
+        )
+        .unwrap();
+        fs::write(
             template.join(".gitea/workflows/pug-app-export.yml"),
             "name: export\n",
         )
@@ -356,12 +363,18 @@ mod tests {
 
         copy_template_dir(&template, &project, "modules").unwrap();
         copy_template_dir(&template, &project, "patches").unwrap();
+        copy_template_file(&template, &project, ENGINE_BUILD_WORKFLOW).unwrap();
         copy_template_file(&template, &project, APP_EXPORT_WORKFLOW).unwrap();
         copy_template_file(&template, &project, EXTENSION_BUILD_WORKFLOW).unwrap();
         copy_template_file(&template, &project, GITATTRIBUTES).unwrap();
 
         assert!(project.join("modules/custom/SCsub").is_file());
         assert!(project.join("patches/001-test/description.md").is_file());
+        assert!(
+            project
+                .join(".gitea/workflows/pug-engine-build.yml")
+                .is_file()
+        );
         assert!(
             project
                 .join(".gitea/workflows/pug-app-export.yml")
