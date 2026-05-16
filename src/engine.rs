@@ -587,7 +587,6 @@ fn build_desktop_templates(ctx: &BuildContext, godot_platform: &str, arch: &str)
         &[("target", "template_release"), ("production", "yes")],
         module_overrides(ctx, "template_release"),
     )?;
-    seal_windows_self_hash(ctx, godot_platform, arch)?;
     copy_binaries(
         &ctx.godot_src,
         &ctx.repo_root
@@ -617,67 +616,6 @@ fn build_desktop_templates(ctx: &BuildContext, godot_platform: &str, arch: &str)
         arch,
         false,
     )
-}
-
-fn seal_windows_self_hash(ctx: &BuildContext, godot_platform: &str, arch: &str) -> Result<()> {
-    if godot_platform != "windows" || arch != "x86_64" || !win_anti_cheat_enabled(ctx) {
-        return Ok(());
-    }
-
-    let script = ctx
-        .repo_root
-        .join("modules/win_anti_cheat/generate_self_hash.py");
-    let header = ctx
-        .repo_root
-        .join("modules/win_anti_cheat/win_ac_self_hash_expected.generated.h");
-    if !script.is_file() || !header.is_file() {
-        return Ok(());
-    }
-
-    let template = find_built_binary(
-        &ctx.godot_src.join("bin"),
-        godot_platform,
-        "template_release",
-        arch,
-    )?;
-    let original_header =
-        fs::read(&header).with_context(|| format!("read {}", header.display()))?;
-
-    eprintln!(
-        "pug: sealing win_anti_cheat self-hash from {}",
-        template.display()
-    );
-    let python = python_command()?;
-    let seal_result = util::run_command(
-        Command::new(python)
-            .arg(&script)
-            .arg(&template)
-            .current_dir(&ctx.repo_root),
-    );
-    if let Err(err) = seal_result {
-        fs::write(&header, &original_header)
-            .with_context(|| format!("restore {}", header.display()))?;
-        return Err(err);
-    }
-
-    let rebuild_result = run_scons(
-        ctx,
-        godot_platform,
-        arch,
-        &[("target", "template_release"), ("production", "yes")],
-        module_overrides(ctx, "template_release"),
-    );
-    fs::write(&header, &original_header)
-        .with_context(|| format!("restore {}", header.display()))?;
-    rebuild_result
-}
-
-fn win_anti_cheat_enabled(ctx: &BuildContext) -> bool {
-    !ctx.project
-        .modules
-        .as_ref()
-        .and_then(|modules| modules.disabled.as_ref())
-        .is_some_and(|disabled| disabled.iter().any(|name| name == "win_anti_cheat"))
 }
 
 fn build_android_templates(ctx: &BuildContext, archs: &[String]) -> Result<()> {
