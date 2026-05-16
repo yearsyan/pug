@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use inquire::Select;
+use inquire::{Confirm, Select};
 use rand::{Rng, distr::Alphanumeric};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, IsTerminal},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -181,7 +181,7 @@ pub fn install(tag: Option<String>, download_only: bool) -> Result<()> {
         println!("{}", zip.display());
         return Ok(());
     }
-    let install_dir = cfg.install_dir()?.join(&response.tag);
+    let install_dir = install_dir_for_tag(&cfg, &response.tag)?;
     util::ensure_clean_dir(&install_dir)?;
     util::unzip_to(&zip, &install_dir)?;
     println!("installed {} -> {}", response.tag, install_dir.display());
@@ -191,7 +191,7 @@ pub fn install(tag: Option<String>, download_only: bool) -> Result<()> {
 fn install_built_engine(ctx: &BuildContext, artifacts: &[BuiltArtifact], tag: &str) -> Result<()> {
     let artifact = choose_built_editor_artifact(ctx, artifacts)?;
     let cfg = Config::load()?;
-    let install_dir = cfg.install_dir()?.join(tag);
+    let install_dir = install_dir_for_tag(&cfg, tag)?;
     util::ensure_clean_dir(&install_dir)?;
     util::unzip_to(&artifact.package_path, &install_dir)?;
     install_built_template_artifacts(artifacts, &install_dir)?;
@@ -274,16 +274,60 @@ fn civil_from_unix_days(days: i64) -> (i32, u32, u32) {
 pub fn use_tag(tag: Option<&str>) -> Result<()> {
     let mut cfg = Config::load()?;
     let tag = match tag {
-        Some(tag) => tag.to_string(),
+        Some(tag) => clean_engine_tag(tag)?.to_string(),
         None => choose_installed_engine_tag(&cfg)?,
     };
-    let install_dir = cfg.install_dir()?.join(&tag);
-    if !install_dir.is_dir() {
-        bail!("engine tag is not installed locally: {tag}");
-    }
+    ensure_engine_installed_for_use(&cfg, &tag)?;
     cfg.engine.current = tag;
     cfg.save()?;
     println!("{}", cfg.engine.current);
+    Ok(())
+}
+
+fn ensure_engine_installed_for_use(cfg: &Config, tag: &str) -> Result<()> {
+    ensure_engine_installed_for_use_with_confirm(
+        cfg,
+        tag,
+        io::stdin().is_terminal() && io::stderr().is_terminal(),
+        || {
+            Confirm::new(&format!(
+                "Engine tag {tag} is not installed locally. Install it from pannel now?"
+            ))
+            .with_default(true)
+            .prompt()
+            .map_err(Into::into)
+        },
+    )
+}
+
+fn ensure_engine_installed_for_use_with_confirm<F>(
+    cfg: &Config,
+    tag: &str,
+    can_prompt: bool,
+    confirm_install: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<bool>,
+{
+    let install_dir = install_dir_for_tag(cfg, tag)?;
+    if install_dir.is_dir() {
+        return Ok(());
+    }
+
+    if !can_prompt {
+        bail!(
+            "engine tag is not installed locally: {tag}; run `pug engine install {tag}` or rerun `pug engine use {tag}` interactively to install it"
+        );
+    }
+
+    if !confirm_install()? {
+        bail!("engine tag is not installed locally: {tag}; install skipped");
+    }
+
+    install(Some(tag.to_string()), false).with_context(|| format!("install engine tag {tag}"))?;
+    if !install_dir.is_dir() {
+        bail!("engine install completed but tag is still not installed locally: {tag}");
+    }
     Ok(())
 }
 
@@ -297,13 +341,50 @@ pub fn current() -> Result<()> {
 }
 
 pub fn uninstall(tag: &str) -> Result<()> {
-    let cfg = Config::load()?;
-    let dir = cfg.install_dir()?.join(tag);
-    if dir.exists() {
-        fs::remove_dir_all(&dir)?;
+    let mut cfg = Config::load()?;
+    let (dir, cleared_current) = uninstall_with_config(&mut cfg, tag)?;
+    if cleared_current {
+        cfg.save()?;
+        println!("removed {} and cleared current engine", dir.display());
+    } else {
+        println!("removed {}", dir.display());
     }
-    println!("removed {}", dir.display());
     Ok(())
+}
+
+fn uninstall_with_config(cfg: &mut Config, tag: &str) -> Result<(PathBuf, bool)> {
+    let tag = clean_engine_tag(tag)?.to_string();
+    let dir = install_dir_for_tag(cfg, &tag)?;
+    if !dir.is_dir() {
+        bail!("engine tag is not installed locally: {tag}");
+    }
+
+    fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    let cleared_current = cfg.engine.current == tag;
+    if cleared_current {
+        cfg.engine.current.clear();
+    }
+    Ok((dir, cleared_current))
+}
+
+fn install_dir_for_tag(cfg: &Config, tag: &str) -> Result<PathBuf> {
+    Ok(cfg.install_dir()?.join(clean_engine_tag(tag)?))
+}
+
+fn clean_engine_tag(tag: &str) -> Result<&str> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        bail!("engine tag must not be empty");
+    }
+    if tag.contains('/') || tag.contains('\\') {
+        bail!("engine tag must not contain path separators: {tag}");
+    }
+
+    let mut components = Path::new(tag).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(tag),
+        _ => bail!("engine tag must be a single path component: {tag}"),
+    }
 }
 
 fn installed_engine_tags(cfg: &Config) -> Result<Vec<String>> {
@@ -359,7 +440,7 @@ pub fn resolve_editor(with_engine: Option<&Path>) -> Result<PathBuf> {
     }
     if let Some(tag) = read_project_engine_tag()? {
         let cfg = Config::load()?;
-        let dir = cfg.install_dir()?.join(&tag);
+        let dir = install_dir_for_tag(&cfg, &tag)?;
         if dir.is_dir() {
             if let Some(path) = find_editor_in_dir(&dir)? {
                 return Ok(path);
@@ -373,7 +454,7 @@ pub fn resolve_editor(with_engine: Option<&Path>) -> Result<PathBuf> {
     }
     let cfg = Config::load()?;
     if !cfg.engine.current.is_empty() {
-        let dir = cfg.install_dir()?.join(&cfg.engine.current);
+        let dir = install_dir_for_tag(&cfg, &cfg.engine.current)?;
         if let Some(path) = find_editor_in_dir(&dir)? {
             return Ok(path);
         }
@@ -395,12 +476,9 @@ pub fn resolve_editor(with_engine: Option<&Path>) -> Result<PathBuf> {
 }
 
 pub fn resolve_editor_for_tag(tag: &str) -> Result<PathBuf> {
-    let tag = tag.trim();
-    if tag.is_empty() {
-        bail!("engine tag must not be empty");
-    }
+    let tag = clean_engine_tag(tag)?;
     let cfg = Config::load()?;
-    let dir = cfg.install_dir()?.join(tag);
+    let dir = install_dir_for_tag(&cfg, tag)?;
     if !dir.is_dir() && cfg.extension.auto_fetch_engine {
         install(Some(tag.to_string()), false)?;
     }
@@ -1046,6 +1124,122 @@ mod tests {
                 .join("export_templates/macos/editor/arm64/artifact.zip")
                 .exists()
         );
+    }
+
+    #[test]
+    fn uninstall_removes_installed_tag_and_clears_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_root = dir.path().join("engines");
+        let tag_dir = install_root.join("tag-a");
+        fs::create_dir_all(&tag_dir).unwrap();
+        fs::write(tag_dir.join("marker.txt"), "installed").unwrap();
+        let mut cfg = Config {
+            engine: crate::config::EngineConfig {
+                install_dir: install_root.to_string_lossy().to_string(),
+                current: "tag-a".to_string(),
+                editor_path: String::new(),
+            },
+            ..Config::default()
+        };
+
+        let (removed, cleared_current) = uninstall_with_config(&mut cfg, "tag-a").unwrap();
+
+        assert_eq!(removed, tag_dir);
+        assert!(cleared_current);
+        assert!(cfg.engine.current.is_empty());
+        assert!(!removed.exists());
+    }
+
+    #[test]
+    fn use_installed_engine_does_not_prompt_for_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_root = dir.path().join("engines");
+        fs::create_dir_all(install_root.join("tag-a")).unwrap();
+        let cfg = Config {
+            engine: crate::config::EngineConfig {
+                install_dir: install_root.to_string_lossy().to_string(),
+                current: String::new(),
+                editor_path: String::new(),
+            },
+            ..Config::default()
+        };
+        let mut prompted = false;
+
+        ensure_engine_installed_for_use_with_confirm(&cfg, "tag-a", true, || {
+            prompted = true;
+            Ok(false)
+        })
+        .unwrap();
+
+        assert!(!prompted);
+    }
+
+    #[test]
+    fn use_missing_engine_requires_interactive_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            engine: crate::config::EngineConfig {
+                install_dir: dir.path().join("engines").to_string_lossy().to_string(),
+                current: String::new(),
+                editor_path: String::new(),
+            },
+            ..Config::default()
+        };
+
+        let err = ensure_engine_installed_for_use_with_confirm(&cfg, "tag-a", false, || Ok(true))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("rerun `pug engine use tag-a`"));
+    }
+
+    #[test]
+    fn use_missing_engine_respects_declined_install_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            engine: crate::config::EngineConfig {
+                install_dir: dir.path().join("engines").to_string_lossy().to_string(),
+                current: String::new(),
+                editor_path: String::new(),
+            },
+            ..Config::default()
+        };
+
+        let err = ensure_engine_installed_for_use_with_confirm(&cfg, "tag-a", true, || Ok(false))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("install skipped"));
+    }
+
+    #[test]
+    fn uninstall_rejects_missing_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_root = dir.path().join("engines");
+        fs::create_dir_all(&install_root).unwrap();
+        let mut cfg = Config {
+            engine: crate::config::EngineConfig {
+                install_dir: install_root.to_string_lossy().to_string(),
+                current: "tag-a".to_string(),
+                editor_path: String::new(),
+            },
+            ..Config::default()
+        };
+
+        let err = uninstall_with_config(&mut cfg, "tag-a").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("engine tag is not installed locally")
+        );
+        assert_eq!(cfg.engine.current, "tag-a");
+    }
+
+    #[test]
+    fn engine_tag_must_be_a_single_path_component() {
+        assert_eq!(clean_engine_tag(" tag-a ").unwrap(), "tag-a");
+        assert!(clean_engine_tag("").is_err());
+        assert!(clean_engine_tag("../tag-a").is_err());
+        assert!(clean_engine_tag("nested/tag-a").is_err());
+        assert!(clean_engine_tag(r"nested\tag-a").is_err());
     }
 
     #[test]
