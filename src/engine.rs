@@ -428,7 +428,9 @@ pub fn start(with_engine: Option<&Path>, project: Option<&Path>, args: &[String]
     let editor = resolve_editor(with_engine)?;
     let mut cmd = Command::new(editor);
     if let Some(project) = project {
-        cmd.arg("--path").arg(project);
+        cmd.arg("--editor").arg("--path").arg(project);
+    } else {
+        cmd.arg("--project-manager");
     }
     cmd.args(args);
     util::run_command(&mut cmd)
