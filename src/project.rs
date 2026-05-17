@@ -31,6 +31,9 @@ const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 const PROJECT_FILE: &str = "project.pug.json";
 const PROJECT_OVERWRITE_FILE: &str = "project-overwrite.pug.json";
 const LOCAL_EXTENSION_PREFIX: &str = "local://";
+const PUG_PCK_MANIFEST_EXPORT_PATH: &str = ".godot_custom/pug_pcks.json";
+const PUG_PCK_MANIFEST_WORK_PATH: &str = ".godot/pug/pug_pcks.json";
+const PUG_PCK_MANIFEST_SOURCE_ENV: &str = "PUG_PCK_MANIFEST_SOURCE";
 const ALWAYS_MAIN_PACK_EXCLUDE_FILTERS: &[&str] = &["project*.pug.json"];
 const RELEASE_MAIN_PACK_EXCLUDE_FILTERS: &[&str] = &["*.cs", "*.cs.uid"];
 
@@ -92,7 +95,8 @@ impl ProjectNugetConfig {
 #[serde(rename_all = "snake_case")]
 enum ProjectPackKind {
     Downloadable,
-    Internal,
+    #[serde(alias = "internal")]
+    Normal,
 }
 
 impl Default for ProjectPackKind {
@@ -105,7 +109,7 @@ impl ProjectPackKind {
     fn name(self) -> &'static str {
         match self {
             Self::Downloadable => "downloadable",
-            Self::Internal => "internal",
+            Self::Normal => "normal",
         }
     }
 }
@@ -137,10 +141,14 @@ impl ProjectPackEncryptType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectPackConfig {
     path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     #[serde(default, rename = "type")]
     kind: ProjectPackKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dist: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_path: Option<PathBuf>,
     #[serde(default)]
     encrypt_type: ProjectPackEncryptType,
 }
@@ -519,14 +527,27 @@ pub fn install(package: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> Result<()> {
+pub fn pack_add(
+    name: &str,
+    path: &Path,
+    normal: bool,
+    id: Option<&str>,
+    mount_path: Option<&Path>,
+    encrypt_type: &str,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut project = read_project_base(&cwd)?;
     let name = normalize_pack_name(name)?;
     let path = normalize_pack_path(path)?;
+    let id = id.map(normalize_pack_id).transpose()?;
+    let mount_path = mount_path
+        .map(normalize_pack_mount_path)
+        .transpose()?
+        .flatten()
+        .map(PathBuf::from);
     let encrypt_type = parse_pack_encrypt_type(encrypt_type)?;
-    let kind = if internal {
-        ProjectPackKind::Internal
+    let kind = if normal {
+        ProjectPackKind::Normal
     } else {
         ProjectPackKind::Downloadable
     };
@@ -534,8 +555,10 @@ pub fn pack_add(name: &str, path: &Path, internal: bool, encrypt_type: &str) -> 
         name.clone(),
         ProjectPackConfig {
             path: PathBuf::from(path),
+            id,
             kind,
             dist: None,
+            mount_path,
             encrypt_type,
         },
     );
@@ -977,6 +1000,7 @@ fn export_project_target(
             )
         })?;
     write_export_credentials(cwd, &presets)?;
+    sync_pug_pck_manifest(cwd, project, target_platform)?;
 
     run_godot_export(
         &editor,
@@ -1656,43 +1680,47 @@ fn sorted_packs(project: &ProjectConfig) -> Vec<(&String, &ProjectPackConfig)> {
 }
 
 fn validate_pack_config(project: &ProjectConfig) -> Result<()> {
+    let mut normal_ids = BTreeSet::new();
     for (name, pack) in &project.packs {
         if let Some(dist) = &pack.dist {
-            if pack.kind != ProjectPackKind::Internal {
-                bail!("pack {name} uses dist, but dist is only supported for internal packs");
+            if pack.kind != ProjectPackKind::Normal {
+                bail!("pack {name} uses dist, but dist is only supported for normal packs");
             }
             normalize_pack_dist(dist).with_context(|| format!("invalid dist for pack {name}"))?;
         }
-    }
-    Ok(())
-}
-
-fn validate_platform_pack_config(project: &ProjectConfig, platform_name: &str) -> Result<()> {
-    if platform_name != "android" {
-        return Ok(());
-    }
-    for (name, pack) in &project.packs {
-        if pack.kind == ProjectPackKind::Internal
-            && pack.encrypt_type != ProjectPackEncryptType::Project
-        {
-            bail!(
-                "android internal pack {name} is merged into assets.pck and must use encrypt_type=project"
-            );
+        if let Some(id) = &pack.id {
+            if pack.kind != ProjectPackKind::Normal {
+                bail!("pack {name} uses id, but id is only supported for normal packs");
+            }
+            normalize_pack_id(id).with_context(|| format!("invalid id for pack {name}"))?;
+        }
+        if let Some(mount_path) = &pack.mount_path {
+            normalize_pack_mount_path(mount_path)
+                .with_context(|| format!("invalid mount_path for pack {name}"))?;
+        }
+        if pack.kind == ProjectPackKind::Normal {
+            let id = normal_pack_id(name, pack)?;
+            if !normal_ids.insert(id.clone()) {
+                bail!("normal pack id {id} is used by more than one pack");
+            }
         }
     }
     Ok(())
 }
 
-fn pack_needs_separate_pck(platform_name: &str, pack: &ProjectPackConfig) -> bool {
+fn validate_platform_pack_config(_project: &ProjectConfig, _platform_name: &str) -> Result<()> {
+    Ok(())
+}
+
+fn pack_needs_separate_pck(_platform_name: &str, pack: &ProjectPackConfig) -> bool {
     match pack.kind {
-        ProjectPackKind::Downloadable => true,
-        ProjectPackKind::Internal => platform_name != "android",
+        ProjectPackKind::Downloadable | ProjectPackKind::Normal => true,
     }
 }
 
 fn main_pack_exclude_filter(
     project: &ProjectConfig,
-    platform_name: &str,
+    _platform_name: &str,
     mode: Option<ExportMode>,
 ) -> Result<String> {
     let mut filters = ALWAYS_MAIN_PACK_EXCLUDE_FILTERS
@@ -1708,8 +1736,7 @@ fn main_pack_exclude_filter(
     }
     for (name, pack) in &project.packs {
         let should_exclude = match pack.kind {
-            ProjectPackKind::Downloadable => true,
-            ProjectPackKind::Internal => platform_name != "android",
+            ProjectPackKind::Downloadable | ProjectPackKind::Normal => true,
         };
         if should_exclude {
             let path = normalize_pack_path(&pack.path)
@@ -1748,12 +1775,12 @@ fn pack_export_path(
             .join("Downloadable")
             .join(platform_dir)
             .join(file_name),
-        ProjectPackKind::Internal => {
+        ProjectPackKind::Normal => {
             let export_dir = export_path_for_platform(project, platform_name, &display_name)?
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or(base_dir.join(platform_dir));
-            let export_dir = if platform_supports_internal_pack_dist(platform_name) {
+            let export_dir = if platform_supports_normal_pack_dist(platform_name) {
                 match pack
                     .dist
                     .as_ref()
@@ -1765,7 +1792,7 @@ fn pack_export_path(
                     None => export_dir,
                 }
             } else {
-                export_dir
+                export_dir.join("data")
             };
             export_dir.join(file_name)
         }
@@ -1773,7 +1800,7 @@ fn pack_export_path(
     Ok(path)
 }
 
-fn platform_supports_internal_pack_dist(platform_name: &str) -> bool {
+fn platform_supports_normal_pack_dist(platform_name: &str) -> bool {
     matches!(platform_name, "windows" | "macos" | "linux")
 }
 
@@ -1797,9 +1824,33 @@ fn normalize_pack_dist(path: &Path) -> Result<Option<PathBuf>> {
     Ok((!normalized.as_os_str().is_empty()).then_some(normalized))
 }
 
+#[derive(Debug)]
+struct PackExportFile {
+    target: String,
+    source: PathBuf,
+}
+
 fn pack_export_files(cwd: &Path, pack_name: &str, pack: &ProjectPackConfig) -> Result<Vec<String>> {
+    Ok(pack_export_file_list(cwd, pack_name, pack)?
+        .into_iter()
+        .map(|file| file.target)
+        .collect())
+}
+
+fn pack_export_file_list(
+    cwd: &Path,
+    pack_name: &str,
+    pack: &ProjectPackConfig,
+) -> Result<Vec<PackExportFile>> {
     let relative = normalize_pack_path(&pack.path)
         .with_context(|| format!("invalid path for pack {pack_name}"))?;
+    let target_root = pack
+        .mount_path
+        .as_ref()
+        .map(|path| normalize_pack_mount_path(path))
+        .transpose()?
+        .flatten()
+        .unwrap_or_else(|| relative.clone());
     let root = cwd.join(&relative);
     if !root.is_dir() {
         bail!(
@@ -1815,18 +1866,24 @@ fn pack_export_files(cwd: &Path, pack_name: &str, pack: &ProjectPackConfig) -> R
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path().strip_prefix(cwd).with_context(|| {
+        let relative_file = entry.path().strip_prefix(&root).with_context(|| {
             format!(
-                "pack {pack_name} file is outside project root: {}",
+                "pack {pack_name} file is outside pack root: {}",
                 entry.path().display()
             )
         })?;
-        let path = path
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        files.push(format!("res://{path}"));
+        let relative_file = godot_path(relative_file);
+        let target = if target_root.is_empty() {
+            format!("res://{relative_file}")
+        } else {
+            format!("res://{target_root}/{relative_file}")
+        };
+        files.push(PackExportFile {
+            target,
+            source: entry.path().to_path_buf(),
+        });
     }
-    files.sort();
+    files.sort_by(|a, b| a.target.cmp(&b.target));
     if files.is_empty() {
         bail!("pack {pack_name} does not contain files");
     }
@@ -2486,6 +2543,24 @@ fn normalize_pack_name(value: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+fn normalize_pack_id(value: &str) -> Result<String> {
+    let id = value.trim();
+    if id.is_empty() {
+        bail!("pack id is required");
+    }
+    if id.contains('/') || id.contains('\\') {
+        bail!("pack id must not contain path separators");
+    }
+    Ok(id.to_string())
+}
+
+fn normal_pack_id(pack_name: &str, pack: &ProjectPackConfig) -> Result<String> {
+    if let Some(id) = pack.id.as_deref() {
+        return normalize_pack_id(id);
+    }
+    Ok(pack_name.to_string())
+}
+
 fn normalize_pack_path(path: &Path) -> Result<String> {
     if path.is_absolute() {
         bail!("pack path must be relative to the Godot project root");
@@ -2510,6 +2585,31 @@ fn normalize_pack_path(path: &Path) -> Result<String> {
         bail!("pack path is required");
     }
     Ok(parts.join("/"))
+}
+
+fn normalize_pack_mount_path(path: &Path) -> Result<Option<String>> {
+    if path.is_absolute() {
+        bail!("pack mount_path must be relative to res://");
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().with_context(|| {
+                    format!("pack mount_path is not valid UTF-8: {}", path.display())
+                })?;
+                if part.is_empty() {
+                    continue;
+                }
+                parts.push(part.to_string());
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                bail!("pack mount_path must stay inside res://")
+            }
+        }
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("/")))
 }
 
 fn parse_pack_encrypt_type(value: &str) -> Result<ProjectPackEncryptType> {
@@ -3122,6 +3222,69 @@ fn write_export_credentials(cwd: &Path, presets: &[ExportPreset]) -> Result<()> 
     Ok(())
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct PugPckManifest {
+    version: u32,
+    packs: Vec<PugPckManifestEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct PugPckManifestEntry {
+    id: String,
+    path: String,
+}
+
+fn sync_pug_pck_manifest(cwd: &Path, project: &ProjectConfig, platform_name: &str) -> Result<()> {
+    let manifest = pug_pck_manifest(project, platform_name)?;
+    let path = cwd.join(PUG_PCK_MANIFEST_WORK_PATH);
+    if manifest.packs.is_empty() {
+        if path.exists() {
+            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn pug_pck_manifest(project: &ProjectConfig, platform_name: &str) -> Result<PugPckManifest> {
+    let mut packs = Vec::new();
+    for (pack_name, pack) in sorted_packs(project) {
+        if pack.kind != ProjectPackKind::Normal {
+            continue;
+        }
+        packs.push(PugPckManifestEntry {
+            id: normal_pack_id(pack_name, pack)?,
+            path: normal_pack_runtime_path(platform_name, pack_name, pack)?,
+        });
+    }
+    Ok(PugPckManifest { version: 1, packs })
+}
+
+fn normal_pack_runtime_path(
+    platform_name: &str,
+    pack_name: &str,
+    pack: &ProjectPackConfig,
+) -> Result<String> {
+    let file_name = format!("{}.pck", safe_file_stem(pack_name));
+    if platform_supports_normal_pack_dist(platform_name) {
+        let mut path = pack
+            .dist
+            .as_ref()
+            .map(|dist| normalize_pack_dist(dist))
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        path.push(file_name);
+        return Ok(godot_path(&path));
+    }
+    Ok(format!("user://data/{file_name}"))
+}
+
 fn run_godot_export(
     editor: &Path,
     cwd: &Path,
@@ -3182,6 +3345,10 @@ fn run_godot_export(
         if let Some(editor_token) = &remote_sign.editor_token {
             cmd.env("GODOT_CUSTOM_INTEGRITY_EDITOR_TOKEN", editor_token);
         }
+    }
+    let pug_pck_manifest_path = cwd.join(PUG_PCK_MANIFEST_WORK_PATH);
+    if pug_pck_manifest_path.is_file() {
+        cmd.env(PUG_PCK_MANIFEST_SOURCE_ENV, &pug_pck_manifest_path);
     }
     util::run_command(&mut cmd)?;
     if !remote_sign.no_remote_sign {
@@ -3297,13 +3464,12 @@ fn pack_export_file_entries(
     pack_name: &str,
     pack: &ProjectPackConfig,
 ) -> Result<Vec<serde_json::Value>> {
-    pack_export_files(cwd, pack_name, pack)?
+    pack_export_file_list(cwd, pack_name, pack)?
         .into_iter()
-        .map(|target| {
-            let relative = target.trim_start_matches("res://");
+        .map(|file| {
             Ok(serde_json::json!({
-                "target": target,
-                "source": cwd.join(relative).to_string_lossy(),
+                "target": file.target,
+                "source": file.source.to_string_lossy(),
             }))
         })
         .collect()
@@ -3781,6 +3947,7 @@ fn update_gitignore(cwd: &Path) -> Result<()> {
             "bin/",
             "export_presets.cfg",
             ".godot/pug/",
+            PUG_PCK_MANIFEST_EXPORT_PATH,
             PROJECT_OVERWRITE_FILE,
         ],
     )
@@ -4400,29 +4567,33 @@ mod tests {
     }
 
     #[test]
-    fn pack_presets_export_downloadable_and_non_android_internal() {
+    fn pack_presets_export_downloadable_and_normal_for_all_platforms() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("packs/dl")).unwrap();
-        fs::create_dir_all(dir.path().join("packs/internal")).unwrap();
+        fs::create_dir_all(dir.path().join("packs/normal")).unwrap();
         fs::write(dir.path().join("packs/dl/level.tscn"), "level").unwrap();
-        fs::write(dir.path().join("packs/internal/shared.tres"), "shared").unwrap();
+        fs::write(dir.path().join("packs/normal/shared.tres"), "shared").unwrap();
 
         let mut packs = BTreeMap::new();
         packs.insert(
             "dl".to_string(),
             ProjectPackConfig {
                 path: PathBuf::from("packs/dl"),
+                id: None,
                 kind: ProjectPackKind::Downloadable,
                 dist: None,
+                mount_path: None,
                 encrypt_type: ProjectPackEncryptType::Random,
             },
         );
         packs.insert(
-            "internal".to_string(),
+            "normal".to_string(),
             ProjectPackConfig {
-                path: PathBuf::from("packs/internal"),
-                kind: ProjectPackKind::Internal,
+                path: PathBuf::from("packs/normal"),
+                id: Some("localization".to_string()),
+                kind: ProjectPackKind::Normal,
                 dist: Some(PathBuf::from("assets")),
+                mount_path: Some(PathBuf::from("Localization")),
                 encrypt_type: ProjectPackEncryptType::Project,
             },
         );
@@ -4450,16 +4621,16 @@ mod tests {
         let (text, presets) = render_export_presets(dir.path(), &project, None).unwrap();
 
         assert!(text.contains("name=\"Pug Pack Android dl\""));
-        assert!(!text.contains("name=\"Pug Pack Android internal\""));
+        assert!(text.contains("name=\"Pug Pack Android normal\""));
         assert!(text.contains("name=\"Pug Pack Windows Desktop dl\""));
-        assert!(text.contains("name=\"Pug Pack Windows Desktop internal\""));
-        assert!(text.contains("export_path=\"../build/demo_export/Windows/assets/internal.pck\""));
+        assert!(text.contains("name=\"Pug Pack Windows Desktop normal\""));
+        assert!(text.contains("export_path=\"../build/demo_export/Android/data/normal.pck\""));
+        assert!(text.contains("export_path=\"../build/demo_export/Windows/assets/normal.pck\""));
         assert!(text.contains("export_filter=\"selected_resources\""));
         assert!(text.contains("res://packs/dl/level.tscn"));
-        assert!(text.contains("res://packs/internal/shared.tres"));
-        assert!(text.contains("exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**\""));
+        assert!(text.contains("res://Localization/shared.tres"));
         assert!(text.contains(
-            "exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**,packs/internal/*,packs/internal/**\""
+            "exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**,packs/normal/*,packs/normal/**\""
         ));
 
         let random = presets
@@ -4470,18 +4641,28 @@ mod tests {
     }
 
     #[test]
-    fn android_internal_pack_rejects_non_project_encryption() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("packs/internal")).unwrap();
-        fs::write(dir.path().join("packs/internal/shared.tres"), "shared").unwrap();
+    fn pug_pck_manifest_contains_only_normal_packs() {
         let mut packs = BTreeMap::new();
         packs.insert(
-            "internal".to_string(),
+            "dl".to_string(),
             ProjectPackConfig {
-                path: PathBuf::from("packs/internal"),
-                kind: ProjectPackKind::Internal,
+                path: PathBuf::from("packs/dl"),
+                id: None,
+                kind: ProjectPackKind::Downloadable,
                 dist: None,
+                mount_path: None,
                 encrypt_type: ProjectPackEncryptType::Random,
+            },
+        );
+        packs.insert(
+            "normal".to_string(),
+            ProjectPackConfig {
+                path: PathBuf::from("packs/normal"),
+                id: Some("localization".to_string()),
+                kind: ProjectPackKind::Normal,
+                dist: Some(PathBuf::from("assets")),
+                mount_path: None,
+                encrypt_type: ProjectPackEncryptType::Project,
             },
         );
         let project = ProjectConfig {
@@ -4490,15 +4671,30 @@ mod tests {
             engine: ProjectEngine {
                 tag: "test".to_string(),
             },
-            platforms: test_platforms(&["android"]),
+            platforms: test_platforms(&["android", "windows"]),
             extensions: BTreeMap::new(),
             packs,
             export: None,
             nuget: ProjectNugetConfig::default(),
         };
 
-        let err = render_export_presets(dir.path(), &project, None).unwrap_err();
-        assert!(err.to_string().contains("must use encrypt_type=project"));
+        let android = pug_pck_manifest(&project, "android").unwrap();
+        assert_eq!(
+            android.packs,
+            vec![PugPckManifestEntry {
+                id: "localization".to_string(),
+                path: "user://data/normal.pck".to_string(),
+            }]
+        );
+
+        let windows = pug_pck_manifest(&project, "windows").unwrap();
+        assert_eq!(
+            windows.packs,
+            vec![PugPckManifestEntry {
+                id: "localization".to_string(),
+                path: "assets/normal.pck".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -198,9 +198,15 @@ struct ProjectPackAddArgs {
     name: String,
     path: PathBuf,
     #[arg(long, conflicts_with = "downloadable")]
+    normal: bool,
+    #[arg(long, conflicts_with_all = ["normal", "downloadable"], hide = true)]
     internal: bool,
-    #[arg(long, conflicts_with = "internal")]
+    #[arg(long, conflicts_with_all = ["normal", "internal"])]
     downloadable: bool,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    mount_path: Option<PathBuf>,
     #[arg(long, default_value = "project", value_parser = ["project", "none", "random"])]
     encrypt_type: String,
 }
@@ -283,9 +289,14 @@ pub fn run() -> Result<()> {
         Commands::Project { command } => match command {
             ProjectCommands::Install(args) => project::install(args.package.as_deref()),
             ProjectCommands::Pack { command } => match command {
-                ProjectPackCommands::Add(args) => {
-                    project::pack_add(&args.name, &args.path, args.internal, &args.encrypt_type)
-                }
+                ProjectPackCommands::Add(args) => project::pack_add(
+                    &args.name,
+                    &args.path,
+                    args.normal || args.internal,
+                    args.id.as_deref(),
+                    args.mount_path.as_deref(),
+                    &args.encrypt_type,
+                ),
             },
             ProjectCommands::Export(args) => {
                 project::export_project(project::ProjectExportOptions {
