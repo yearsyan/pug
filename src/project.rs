@@ -4432,9 +4432,10 @@ mod tests {
         sync_nuget_config(dir.path(), &project, Some(&editor)).unwrap();
 
         let config = fs::read_to_string(dir.path().join(NUGET_CONFIG_FILE)).unwrap();
+        let normalized_config = config.replace('\\', "/");
         assert!(config.contains("<clear />"));
         assert!(config.contains("key=\"globalPackagesFolder\""));
-        assert!(config.contains(".godot/pug/nuget/packages/test-empty"));
+        assert!(normalized_config.contains(".godot/pug/nuget/packages/test-empty"));
         assert!(config.contains("key=\"godot-local\""));
         assert!(config.contains("GodotSharp"));
         assert!(config.contains("key=\"private-feed\""));
