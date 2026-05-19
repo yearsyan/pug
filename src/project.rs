@@ -1408,7 +1408,8 @@ fn sync_nuget_config(
         None => engine::resolve_editor(None)?,
     };
     let source_dir = godot_nuget_source_dir(&editor)?;
-    let text = render_nuget_config(project, &source_dir)?;
+    let global_packages_dir = nuget_global_packages_dir(cwd, project, &source_dir)?;
+    let text = render_nuget_config(project, &source_dir, &global_packages_dir)?;
     let path = cwd.join(NUGET_CONFIG_FILE);
     fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     update_gitignore_entries(cwd, &[NUGET_CONFIG_FILE])?;
@@ -1454,10 +1455,90 @@ fn make_absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn render_nuget_config(project: &ProjectConfig, godot_source_dir: &Path) -> Result<String> {
-    let mut text = String::from(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <clear />\n",
-    );
+fn nuget_global_packages_dir(
+    cwd: &Path,
+    project: &ProjectConfig,
+    godot_source_dir: &Path,
+) -> Result<PathBuf> {
+    let fingerprint = nuget_source_fingerprint(godot_source_dir)?;
+    Ok(make_absolute_path(
+        &cwd.join(".godot")
+            .join("pug")
+            .join("nuget")
+            .join("packages")
+            .join(format!(
+                "{}-{fingerprint}",
+                sanitize_path_component(&project.engine.tag)
+            )),
+    )?)
+}
+
+fn nuget_source_fingerprint(source_dir: &Path) -> Result<String> {
+    let mut packages = Vec::new();
+    for entry in
+        fs::read_dir(source_dir).with_context(|| format!("read {}", source_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nupkg"))
+        {
+            packages.push(path);
+        }
+    }
+    packages.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
+    if packages.is_empty() {
+        return Ok("empty".to_string());
+    }
+
+    let mut hasher = Sha256::new();
+    for package in packages {
+        let name = package
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(util::sha256_file(&package)?.as_bytes());
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize())[..16].to_string())
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "engine".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn render_nuget_config(
+    project: &ProjectConfig,
+    godot_source_dir: &Path,
+    global_packages_dir: &Path,
+) -> Result<String> {
+    let mut text = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n");
+    text.push_str("  <config>\n");
+    text.push_str(&format!(
+        "    <add key=\"globalPackagesFolder\" value=\"{}\" />\n",
+        xml_escape(&nuget_path_value(global_packages_dir))
+    ));
+    text.push_str("  </config>\n");
+    text.push_str("  <packageSources>\n    <clear />\n");
     text.push_str(&format!(
         "    <add key=\"{}\" value=\"{}\" />\n",
         xml_escape(NUGET_GODOT_SOURCE),
@@ -2729,7 +2810,26 @@ fn installed_export_templates(
         .join("export_templates")
         .join(&project.engine.tag);
 
-    if matches!(platform_name, "windows" | "macos" | "linux") {
+    if platform_name == "macos" {
+        let arch = export_arch_for_platform(project, platform_name)?;
+        let Some(dir) = unpack_installed_template_artifact(
+            &install_root,
+            &cache_root,
+            platform_name,
+            mode.template_kind(),
+            &arch,
+        )?
+        else {
+            return Ok(None);
+        };
+        let template = find_macos_template_zip(&dir, mode.template_kind())?;
+        return Ok(Some(ExportTemplates {
+            custom_template: Some(template),
+            android_source_template: None,
+        }));
+    }
+
+    if matches!(platform_name, "windows" | "linux") {
         let arch = export_arch_for_platform(project, platform_name)?;
         let Some(dir) = unpack_installed_template_artifact(
             &install_root,
@@ -2859,7 +2959,22 @@ fn local_export_templates(
                 android_source_template: None,
             })
         }
-        "macos" | "windows" | "linux" => {
+        "macos" => {
+            let arch = export_arch_for_platform(project, platform_name)?;
+            let dir = repo_root.join("build/macos/export_templates");
+            let template = find_macos_template_zip(&dir, mode.template_kind())
+                .with_context(|| format!("local macOS template not found for {arch}"))?;
+            eprintln!(
+                "pug: using local {} template {}",
+                platform_name,
+                template.display()
+            );
+            Ok(ExportTemplates {
+                custom_template: Some(template),
+                android_source_template: None,
+            })
+        }
+        "windows" | "linux" => {
             let arch = export_arch_for_platform(project, platform_name)?;
             let target = platform::spec(platform_name, &arch)?;
             let dir = repo_root
@@ -2901,7 +3016,34 @@ fn download_export_templates(
         .join("export_templates")
         .join(&response.tag);
 
-    if matches!(platform_name, "windows" | "macos" | "linux") {
+    if platform_name == "macos" {
+        let arch = export_arch_for_platform(project, platform_name)?;
+        let artifact = response
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.platform == platform_name
+                    && artifact.kind == mode.template_kind()
+                    && artifact.arch == arch
+            })
+            .with_context(|| {
+                format!(
+                    "engine {} has no {} template for {}:{}",
+                    response.tag,
+                    mode.template_kind(),
+                    platform_name,
+                    arch
+                )
+            })?;
+        let dir = download_engine_artifact(&api, artifact, &cache_root)?;
+        let template = find_macos_template_zip(&dir, mode.template_kind())?;
+        return Ok(ExportTemplates {
+            custom_template: Some(template),
+            android_source_template: None,
+        });
+    }
+
+    if matches!(platform_name, "windows" | "linux") {
         let arch = export_arch_for_platform(project, platform_name)?;
         let artifact = response
             .artifacts
@@ -3033,6 +3175,28 @@ fn find_template_file(dir: &Path, kind: &str) -> Result<PathBuf> {
     })
     .or_else(|| find_file_by(dir, &is_template))
     .with_context(|| format!("no {kind} template found under {}", dir.display()))
+}
+
+fn find_macos_template_zip(dir: &Path, kind: &str) -> Result<PathBuf> {
+    let is_zip = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".zip"))
+    };
+    find_file_by(dir, &|path| {
+        is_zip(path)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(kind))
+    })
+    .or_else(|| {
+        find_file_by(dir, &|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("macos.zip")
+        })
+    })
+    .or_else(|| find_file_by(dir, &is_zip))
+    .with_context(|| format!("no macOS template zip found under {}", dir.display()))
 }
 
 fn find_named_file(dir: &Path, file_name: &str) -> Result<PathBuf> {
@@ -4170,6 +4334,39 @@ mod tests {
     }
 
     #[test]
+    fn macos_installed_template_resolves_inner_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_root = dir.path().join("engine");
+        let cache_root = dir
+            .path()
+            .join("project/.godot/pug/export_templates/local-test");
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        let template = source.join("macos-template_release-arm64.zip");
+        fs::write(&template, b"template").unwrap();
+
+        let zip =
+            installed_template_artifact_zip(&install_root, "macos", "template_release", "arm64");
+        util::zip_paths(&zip, &source, std::slice::from_ref(&template)).unwrap();
+
+        let unpack = unpack_installed_template_artifact(
+            &install_root,
+            &cache_root,
+            "macos",
+            "template_release",
+            "arm64",
+        )
+        .unwrap()
+        .unwrap();
+
+        let found = find_macos_template_zip(&unpack, "template_release").unwrap();
+        assert_eq!(
+            found.file_name().and_then(|name| name.to_str()),
+            Some("macos-template_release-arm64.zip")
+        );
+    }
+
+    #[test]
     fn legacy_export_platform_config_migrates_into_platforms() {
         let mut project: ProjectConfig = serde_json::from_str(
             r#"{"engine":{"tag":"test"},"platforms":["android"],"export":{"android":{"package":"com.example.demo","signed":false}}}"#,
@@ -4236,6 +4433,8 @@ mod tests {
 
         let config = fs::read_to_string(dir.path().join(NUGET_CONFIG_FILE)).unwrap();
         assert!(config.contains("<clear />"));
+        assert!(config.contains("key=\"globalPackagesFolder\""));
+        assert!(config.contains(".godot/pug/nuget/packages/test-empty"));
         assert!(config.contains("key=\"godot-local\""));
         assert!(config.contains("GodotSharp"));
         assert!(config.contains("key=\"private-feed\""));
@@ -4283,7 +4482,12 @@ mod tests {
             nuget: ProjectNugetConfig { sources },
         };
 
-        let err = render_nuget_config(&project, Path::new("/tmp/nupkgs")).unwrap_err();
+        let err = render_nuget_config(
+            &project,
+            Path::new("/tmp/nupkgs"),
+            Path::new("/tmp/packages"),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string()

@@ -660,6 +660,10 @@ fn build_templates(ctx: &BuildContext) -> Result<()> {
 }
 
 fn build_desktop_templates(ctx: &BuildContext, godot_platform: &str, arch: &str) -> Result<()> {
+    if godot_platform == "macos" {
+        return build_macos_templates(ctx, arch);
+    }
+
     run_scons(
         ctx,
         godot_platform,
@@ -696,6 +700,54 @@ fn build_desktop_templates(ctx: &BuildContext, godot_platform: &str, arch: &str)
         arch,
         false,
     )
+}
+
+fn build_macos_templates(ctx: &BuildContext, arch: &str) -> Result<()> {
+    run_scons(
+        ctx,
+        "macos",
+        arch,
+        &[("target", "template_release"), ("production", "yes")],
+        module_overrides(ctx, "template_release"),
+    )?;
+    run_scons(
+        ctx,
+        "macos",
+        arch,
+        &[("target", "template_debug"), ("dev_mode", "yes")],
+        module_overrides(ctx, "template_debug"),
+    )?;
+    create_macos_template_zip(ctx, arch, "template_release", "release")?;
+    create_macos_template_zip(ctx, arch, "template_debug", "debug")?;
+    Ok(())
+}
+
+fn create_macos_template_zip(
+    ctx: &BuildContext,
+    arch: &str,
+    kind: &str,
+    mode_name: &str,
+) -> Result<PathBuf> {
+    let out = ctx.repo_root.join("build/macos/export_templates");
+    fs::create_dir_all(&out)?;
+
+    let staging = out.join(format!(".macos-{kind}-{arch}-staging"));
+    util::ensure_clean_dir(&staging)?;
+    let app = staging.join("macos_template.app");
+    util::copy_dir(&ctx.godot_src.join("misc/dist/macos_template.app"), &app)?;
+    fs::create_dir_all(app.join("Contents/MacOS"))?;
+
+    let binary = find_built_binary(&ctx.godot_src.join("bin"), "macos", kind, arch)?;
+    util::copy_file(
+        &binary,
+        &app.join("Contents/MacOS")
+            .join(format!("godot_macos_{mode_name}.{arch}")),
+    )?;
+
+    let zip = out.join(format!("macos-{kind}-{arch}.zip"));
+    util::zip_paths(&zip, &staging, std::slice::from_ref(&app))?;
+    fs::remove_dir_all(&staging).with_context(|| format!("remove {}", staging.display()))?;
+    Ok(zip)
 }
 
 fn build_android_templates(ctx: &BuildContext, archs: &[String]) -> Result<()> {

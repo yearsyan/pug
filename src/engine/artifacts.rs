@@ -40,7 +40,26 @@ pub(super) fn package_engine_artifacts(ctx: &BuildContext) -> Result<Vec<BuiltAr
     let mut bundled = BTreeSet::new();
     for target in &ctx.template_targets {
         match target.platform.as_str() {
-            "macos" | "linux" | "windows" => {
+            "macos" => {
+                let dir = ctx.repo_root.join("build/macos/export_templates");
+                for kind in ["template_debug", "template_release"] {
+                    let template = dir.join(format!("macos-{kind}-{}.zip", target.arch));
+                    if !template.is_file() {
+                        bail!("macOS template zip not found at {}", template.display());
+                    }
+                    let zip =
+                        package_dir.join(format!("{}-{kind}-{}.zip", target.platform, target.arch));
+                    util::zip_paths(&zip, &dir, std::slice::from_ref(&template))?;
+                    out.push(make_built_artifact(
+                        &target.platform,
+                        kind,
+                        Some(&target.arch),
+                        Vec::new(),
+                        zip,
+                    )?);
+                }
+            }
+            "linux" | "windows" => {
                 let dir = ctx
                     .repo_root
                     .join("build")
@@ -465,6 +484,53 @@ mod tests {
         assert!(
             names.contains(&"godot.windows.template_release.x86_64.mono.console.exe".to_string())
         );
+    }
+
+    #[test]
+    fn macos_template_package_contains_template_zip() {
+        let repo = tempfile::tempdir().unwrap();
+        let editor_dir = repo.path().join("build/macos/editor/arm64");
+        fs::create_dir_all(&editor_dir).unwrap();
+        fs::write(editor_dir.join("godot.macos.editor.arm64.mono"), "editor").unwrap();
+
+        let template_dir = repo.path().join("build/macos/export_templates");
+        fs::create_dir_all(&template_dir).unwrap();
+        for kind in ["template_debug", "template_release"] {
+            fs::write(
+                template_dir.join(format!("macos-{kind}-arm64.zip")),
+                "template",
+            )
+            .unwrap();
+        }
+
+        let ctx = BuildContext {
+            repo_root: repo.path().to_path_buf(),
+            godot_src: repo.path().join("godot"),
+            project: ProjectJson::default(),
+            host_godot: "macos",
+            host_api: "macos",
+            host_arch: "arm64",
+            template_targets: vec![TemplateTarget {
+                platform: "macos".to_string(),
+                godot_platform: "macos".to_string(),
+                arch: "arm64".to_string(),
+            }],
+            scons_args: Vec::new(),
+            manifest_public_key_path: None,
+        };
+
+        let artifacts = package_engine_artifacts(&ctx).unwrap();
+        let release = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "template_release")
+            .unwrap();
+        let file = fs::File::open(&release.package_path).unwrap();
+        let mut zip = ZipArchive::new(file).unwrap();
+        let names = (0..zip.len())
+            .map(|index| zip.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"macos-template_release-arm64.zip".to_string()));
     }
 
     fn remote_artifact(platform: &str, kind: &str, arch: &str) -> RemoteEngineArtifact {
