@@ -1857,10 +1857,15 @@ fn pack_export_path(
             .join(platform_dir)
             .join(file_name),
         ProjectPackKind::Normal => {
-            let export_dir = export_path_for_platform(project, platform_name, &display_name)?
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or(base_dir.join(platform_dir));
+            let export_path = export_path_for_platform(project, platform_name, &display_name)?;
+            let export_dir = if platform_name == "macos" {
+                export_path.join("Contents").join("Resources")
+            } else {
+                export_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or(base_dir.join(platform_dir))
+            };
             let export_dir = if platform_supports_normal_pack_dist(platform_name) {
                 match pack
                     .dist
@@ -4808,7 +4813,7 @@ mod tests {
             engine: ProjectEngine {
                 tag: "test".to_string(),
             },
-            platforms: test_platforms(&["android", "windows"]),
+            platforms: test_platforms(&["android", "windows", "macos"]),
             extensions: BTreeMap::new(),
             packs,
             export: Some(ProjectExportConfig {
@@ -4829,8 +4834,13 @@ mod tests {
         assert!(text.contains("name=\"Pug Pack Android normal\""));
         assert!(text.contains("name=\"Pug Pack Windows Desktop dl\""));
         assert!(text.contains("name=\"Pug Pack Windows Desktop normal\""));
+        assert!(text.contains("name=\"Pug Pack macOS dl\""));
+        assert!(text.contains("name=\"Pug Pack macOS normal\""));
         assert!(text.contains("export_path=\"../build/demo_export/Android/data/normal.pck\""));
         assert!(text.contains("export_path=\"../build/demo_export/Windows/assets/normal.pck\""));
+        assert!(text.contains(
+            "export_path=\"../build/demo_export/macOS/Demo.app/Contents/Resources/assets/normal.pck\""
+        ));
         assert!(text.contains("export_filter=\"selected_resources\""));
         assert!(text.contains("res://packs/dl/level.tscn"));
         assert!(text.contains("res://Localization/shared.tres"));
@@ -4876,7 +4886,7 @@ mod tests {
             engine: ProjectEngine {
                 tag: "test".to_string(),
             },
-            platforms: test_platforms(&["android", "windows"]),
+            platforms: test_platforms(&["android", "windows", "macos"]),
             extensions: BTreeMap::new(),
             packs,
             export: None,
@@ -4895,6 +4905,15 @@ mod tests {
         let windows = pug_pck_manifest(&project, "windows").unwrap();
         assert_eq!(
             windows.packs,
+            vec![PugPckManifestEntry {
+                id: "localization".to_string(),
+                path: "assets/normal.pck".to_string(),
+            }]
+        );
+
+        let macos = pug_pck_manifest(&project, "macos").unwrap();
+        assert_eq!(
+            macos.packs,
             vec![PugPckManifestEntry {
                 id: "localization".to_string(),
                 path: "assets/normal.pck".to_string(),
