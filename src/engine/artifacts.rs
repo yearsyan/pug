@@ -153,9 +153,14 @@ pub(super) fn upload_engine_artifacts(
     ctx: &BuildContext,
     artifacts: &[BuiltArtifact],
     force: bool,
+    tag: Option<&str>,
 ) -> Result<Option<String>> {
     let cfg = Config::load()?;
     let api = ApiClient::from_config(&cfg)?;
+    let requested_tag = tag.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(name) = requested_tag {
+        println!("pug: requesting custom engine tag {name}");
+    }
     let project_name = ctx
         .project
         .name
@@ -223,6 +228,7 @@ pub(super) fn upload_engine_artifacts(
             package_sha256: &artifact.sha256,
             package_size: artifact.size,
             force,
+            tag: requested_tag,
         })?;
         api.put_file(&init, &artifact.package_path)?;
         let complete = api.engine_upload_complete(&init.upload_id)?;

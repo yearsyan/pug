@@ -52,6 +52,7 @@ pub struct EngineBuildOptions {
     pub skip_patches: bool,
     pub no_restore: bool,
     pub force: bool,
+    pub tag: Option<String>,
     pub scons_args: Vec<String>,
 }
 
@@ -85,7 +86,7 @@ pub fn build(opts: EngineBuildOptions) -> Result<()> {
         if opts.upload || opts.install {
             let artifacts = package_engine_artifacts(&ctx)?;
             let remote_tag = if opts.upload {
-                upload_engine_artifacts(&ctx, &artifacts, opts.force)?
+                upload_engine_artifacts(&ctx, &artifacts, opts.force, opts.tag.as_deref())?
             } else {
                 None
             };

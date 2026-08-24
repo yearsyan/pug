@@ -188,6 +188,8 @@ pub struct EngineUploadInit<'a> {
     pub package_sha256: &'a str,
     pub package_size: i64,
     pub force: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]

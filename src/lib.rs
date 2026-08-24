@@ -71,6 +71,8 @@ struct EngineBuildArgs {
     no_restore: bool,
     #[arg(long)]
     force: bool,
+    #[arg(long, help = "custom engine tag name for --upload (letters/digits/._-, max 64 chars)")]
+    tag: Option<String>,
     #[arg(last = true)]
     scons_args: Vec<String>,
 }
@@ -240,6 +242,7 @@ pub fn run() -> Result<()> {
                 skip_patches: args.skip_patches,
                 no_restore: args.no_restore,
                 force: args.force,
+                tag: args.tag,
                 scons_args: args.scons_args,
             }),
             EngineCommands::List(args) => engine::list(args.remote),
