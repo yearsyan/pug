@@ -114,30 +114,6 @@ impl ProjectPackKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ProjectPackEncryptType {
-    Project,
-    None,
-    Random,
-}
-
-impl Default for ProjectPackEncryptType {
-    fn default() -> Self {
-        Self::Project
-    }
-}
-
-impl ProjectPackEncryptType {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Project => "project",
-            Self::None => "none",
-            Self::Random => "random",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProjectPackConfig {
     path: PathBuf,
@@ -149,8 +125,6 @@ struct ProjectPackConfig {
     dist: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mount_path: Option<PathBuf>,
-    #[serde(default)]
-    encrypt_type: ProjectPackEncryptType,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -159,19 +133,7 @@ struct ProjectExportConfig {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_dir: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encrypt: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encrypt_pck: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encrypt_directory: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encryption_include_filters: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    encryption_exclude_filters: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    script_encryption_key: Option<String>,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     windows: Option<ProjectPlatformConfig>,
     #[serde(default, skip_serializing)]
     macos: Option<ProjectPlatformConfig>,
@@ -420,7 +382,6 @@ pub struct ProjectExportOptions {
     pub debug: bool,
     pub release: bool,
     pub upload: bool,
-    pub no_remote_sign: bool,
     pub with_engine: Option<PathBuf>,
 }
 
@@ -533,7 +494,6 @@ pub fn pack_add(
     normal: bool,
     id: Option<&str>,
     mount_path: Option<&Path>,
-    encrypt_type: &str,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut project = read_project_base(&cwd)?;
@@ -545,7 +505,6 @@ pub fn pack_add(
         .transpose()?
         .flatten()
         .map(PathBuf::from);
-    let encrypt_type = parse_pack_encrypt_type(encrypt_type)?;
     let kind = if normal {
         ProjectPackKind::Normal
     } else {
@@ -559,7 +518,6 @@ pub fn pack_add(
             kind,
             dist: None,
             mount_path,
-            encrypt_type,
         },
     );
     write_project(&cwd, &project)?;
@@ -971,14 +929,6 @@ fn export_project_target(
     } else {
         project.name.clone()
     };
-    let remote_sign = if opts.no_remote_sign {
-        RemoteSignEnv::disabled()
-    } else {
-        let token = api
-            .editor_token(&project_name)
-            .with_context(|| format!("request editor signing token for project {project_name}"))?;
-        RemoteSignEnv::enabled(cfg.base_url(), project_name.clone(), token.editor_token)
-    };
 
     let android_keystore =
         prepare_android_keystore_override(cwd, project, target_platform, mode, &editor)?;
@@ -999,7 +949,6 @@ fn export_project_target(
                 target_platform
             )
         })?;
-    write_export_credentials(cwd, &presets)?;
     sync_pug_pck_manifest(cwd, project, target_platform)?;
 
     run_godot_export(
@@ -1009,7 +958,6 @@ fn export_project_target(
         target_platform,
         mode,
         templates.android_source_template.is_some(),
-        &remote_sign,
     )?;
     export_pack_presets(&editor, cwd, project, &presets, target_platform)?;
 
@@ -1032,38 +980,9 @@ fn export_project_target(
             target_platform,
             mode,
             &export_path,
-            opts.no_remote_sign,
         )?;
     }
     Ok(())
-}
-
-#[derive(Debug)]
-struct RemoteSignEnv {
-    base_url: Option<String>,
-    project_name: Option<String>,
-    editor_token: Option<String>,
-    no_remote_sign: bool,
-}
-
-impl RemoteSignEnv {
-    fn enabled(base_url: String, project_name: String, editor_token: String) -> Self {
-        Self {
-            base_url: Some(base_url),
-            project_name: Some(project_name),
-            editor_token: Some(editor_token),
-            no_remote_sign: false,
-        }
-    }
-
-    fn disabled() -> Self {
-        Self {
-            base_url: None,
-            project_name: None,
-            editor_token: None,
-            no_remote_sign: true,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1269,12 +1188,10 @@ fn generate_android_keystore_password() -> String {
 
 #[derive(Debug)]
 struct ExportPreset {
-    index: usize,
     name: String,
     platform: String,
     export_path: PathBuf,
     kind: ExportPresetKind,
-    credential_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1283,7 +1200,6 @@ enum ExportPresetKind {
     Pack {
         pack_name: String,
         pack_kind: ProjectPackKind,
-        encrypt_type: ProjectPackEncryptType,
     },
 }
 
@@ -1617,14 +1533,6 @@ fn render_export_presets(
 ) -> Result<(String, Vec<ExportPreset>)> {
     let platforms = export_platforms(project)?;
     let display_name = export_display_name(project);
-    let encrypt_pck = export_encrypt_pck(project);
-    let encrypt_directory = export_encrypt_directory(project);
-    let include_filters = export_config(project)
-        .and_then(|export| export.encryption_include_filters.as_deref())
-        .unwrap_or("*");
-    let exclude_filters = export_config(project)
-        .and_then(|export| export.encryption_exclude_filters.as_deref())
-        .unwrap_or(".godot/extension_list.cfg,*.gdextension,.godot_custom/signatures.csv");
 
     let mut text = String::from(
         "; This file is generated by pug from project.pug.json.\n; Manual changes will be overwritten by `pug project install` and `pug project export`.\n\n",
@@ -1657,20 +1565,7 @@ fn render_export_presets(
             cfg_string(&main_exclude_filter)
         ));
         text.push_str(&format!("export_path={}\n", cfg_path(&export_path)));
-        text.push_str("patches=PackedStringArray()\n");
-        text.push_str(&format!(
-            "encryption_include_filters={}\n",
-            cfg_string(include_filters)
-        ));
-        text.push_str(&format!(
-            "encryption_exclude_filters={}\n",
-            cfg_string(exclude_filters)
-        ));
-        text.push_str(&format!("encrypt_pck={}\n", cfg_bool(encrypt_pck)));
-        text.push_str(&format!(
-            "encrypt_directory={}\n\n",
-            cfg_bool(encrypt_directory)
-        ));
+        text.push_str("patches=PackedStringArray()\n\n");
         text.push_str(&format!("[preset.{index}.options]\n"));
         text.push_str("dotnet/include_debug_symbols=false\n");
         for (key, value) in
@@ -1680,12 +1575,10 @@ fn render_export_presets(
         }
         text.push('\n');
         presets.push(ExportPreset {
-            index,
             name: preset_name.to_string(),
             platform: preset_name.to_string(),
             export_path,
             kind: ExportPresetKind::App,
-            credential_key: app_preset_encryption_key(project)?,
         });
     }
     for platform_name in platforms.iter() {
@@ -1698,8 +1591,6 @@ fn render_export_presets(
             let platform_preset_name = preset_platform_name(platform_name)?;
             let export_path = pack_export_path(project, platform_name, pack_name, pack)?;
             let export_files = pack_export_files(cwd, pack_name, pack)?;
-            let (encrypt_pck, encrypt_directory, credential_key) =
-                pack_encryption_settings(project, pack)?;
             text.push_str(&format!("[preset.{index}]\n"));
             text.push_str(&format!("name={}\n", cfg_string(&preset_name)));
             text.push_str(&format!("platform={}\n", cfg_string(platform_preset_name)));
@@ -1714,20 +1605,7 @@ fn render_export_presets(
             text.push_str("include_filter=\"\"\n");
             text.push_str("exclude_filter=\"\"\n");
             text.push_str(&format!("export_path={}\n", cfg_path(&export_path)));
-            text.push_str("patches=PackedStringArray()\n");
-            text.push_str(&format!(
-                "encryption_include_filters={}\n",
-                cfg_string(include_filters)
-            ));
-            text.push_str(&format!(
-                "encryption_exclude_filters={}\n",
-                cfg_string(exclude_filters)
-            ));
-            text.push_str(&format!("encrypt_pck={}\n", cfg_bool(encrypt_pck)));
-            text.push_str(&format!(
-                "encrypt_directory={}\n\n",
-                cfg_bool(encrypt_directory)
-            ));
+            text.push_str("patches=PackedStringArray()\n\n");
             text.push_str(&format!("[preset.{index}.options]\n"));
             text.push_str("dotnet/include_debug_symbols=false\n");
             for (key, value) in export_options_for_platform(
@@ -1740,16 +1618,13 @@ fn render_export_presets(
             }
             text.push('\n');
             presets.push(ExportPreset {
-                index,
                 name: preset_name,
                 platform: platform_preset_name.to_string(),
                 export_path,
                 kind: ExportPresetKind::Pack {
                     pack_name: pack_name.clone(),
                     pack_kind: pack.kind,
-                    encrypt_type: pack.encrypt_type,
                 },
-                credential_key,
             });
         }
     }
@@ -1974,45 +1849,6 @@ fn pack_export_file_list(
         bail!("pack {pack_name} does not contain files");
     }
     Ok(files)
-}
-
-fn app_preset_encryption_key(project: &ProjectConfig) -> Result<Option<String>> {
-    if export_encryption_enabled(project) {
-        return export_encryption_key(project).with_context(|| {
-            "project.pug.json export enables encryption; set export.script_encryption_key or SCRIPT_AES256_ENCRYPTION_KEY"
-        }).map(Some);
-    }
-    Ok(None)
-}
-
-fn pack_encryption_settings(
-    project: &ProjectConfig,
-    pack: &ProjectPackConfig,
-) -> Result<(bool, bool, Option<String>)> {
-    match pack.encrypt_type {
-        ProjectPackEncryptType::None => Ok((false, false, None)),
-        ProjectPackEncryptType::Project => {
-            if !export_encryption_enabled(project) {
-                return Ok((false, false, None));
-            }
-            let key = export_encryption_key(project).with_context(|| {
-                "pack uses encrypt_type=project but project export encryption key is not configured"
-            })?;
-            Ok((
-                export_encrypt_pck(project),
-                export_encrypt_directory(project),
-                Some(key),
-            ))
-        }
-        ProjectPackEncryptType::Random => Ok((true, true, Some(generate_pack_encryption_key()))),
-    }
-}
-
-fn generate_pack_encryption_key() -> String {
-    let mut rng = rand::rng();
-    let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn export_options_for_platform(
@@ -2426,32 +2262,6 @@ fn preset_runnable(platform_name: &str) -> bool {
     matches!(platform_name, "windows" | "android")
 }
 
-fn export_encrypt_pck(project: &ProjectConfig) -> bool {
-    export_config(project)
-        .map(|export| {
-            export
-                .encrypt_pck
-                .or(export.encrypt)
-                .unwrap_or_else(|| export.script_encryption_key.is_some())
-        })
-        .unwrap_or(false)
-}
-
-fn export_encrypt_directory(project: &ProjectConfig) -> bool {
-    export_config(project)
-        .map(|export| {
-            export
-                .encrypt_directory
-                .or(export.encrypt)
-                .unwrap_or_else(|| export.script_encryption_key.is_some())
-        })
-        .unwrap_or(false)
-}
-
-fn export_encryption_enabled(project: &ProjectConfig) -> bool {
-    export_encrypt_pck(project) || export_encrypt_directory(project)
-}
-
 fn bundle_identifier(project: &ProjectConfig, platform_name: &str, display_name: &str) -> String {
     platform_export_config(project, platform_name)
         .and_then(|config| config.bundle_identifier.as_deref())
@@ -2696,15 +2506,6 @@ fn normalize_pack_mount_path(path: &Path) -> Result<Option<String>> {
         }
     }
     Ok((!parts.is_empty()).then(|| parts.join("/")))
-}
-
-fn parse_pack_encrypt_type(value: &str) -> Result<ProjectPackEncryptType> {
-    match value.trim() {
-        "project" => Ok(ProjectPackEncryptType::Project),
-        "none" => Ok(ProjectPackEncryptType::None),
-        "random" => Ok(ProjectPackEncryptType::Random),
-        other => bail!("unsupported pack encrypt_type: {other}"),
-    }
 }
 
 fn parse_package(value: &str) -> Result<(String, Option<String>)> {
@@ -3228,17 +3029,6 @@ fn find_file_by(dir: &Path, predicate: &dyn Fn(&Path) -> bool) -> Option<PathBuf
     None
 }
 
-#[cfg(test)]
-fn rewrite_manifest(
-    cwd: &Path,
-    name: &str,
-    project: &ProjectConfig,
-    template_text: &str,
-) -> Result<()> {
-    let platforms = export_platforms(project)?;
-    rewrite_manifest_for_platforms(cwd, name, project, template_text, &platforms)
-}
-
 fn rewrite_manifest_for_platforms(
     cwd: &Path,
     name: &str,
@@ -3360,37 +3150,6 @@ fn godot_path(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
-fn export_encryption_key(project: &ProjectConfig) -> Option<String> {
-    project
-        .export
-        .as_ref()
-        .and_then(|export| export.script_encryption_key.as_deref())
-        .map(str::to_string)
-        .or_else(|| env::var("PUG_SCRIPT_AES256_ENCRYPTION_KEY").ok())
-        .or_else(|| env::var("SCRIPT_AES256_ENCRYPTION_KEY").ok())
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
-}
-
-fn write_export_credentials(cwd: &Path, presets: &[ExportPreset]) -> Result<()> {
-    let path = cwd.join(".godot").join("export_credentials.cfg");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut text = String::new();
-    for preset in presets {
-        let Some(key) = preset.credential_key.as_deref() else {
-            continue;
-        };
-        text.push_str(&format!(
-            "[preset.{}]\nscript_encryption_key=\"{key}\"\n\n",
-            preset.index
-        ));
-    }
-    fs::write(path, text)?;
-    Ok(())
-}
-
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct PugPckManifest {
     version: u32,
@@ -3461,7 +3220,6 @@ fn run_godot_export(
     platform_name: &str,
     mode: ExportMode,
     install_android_template: bool,
-    remote_sign: &RemoteSignEnv,
 ) -> Result<()> {
     let android_env = if platform_name == "android" {
         Some(ensure_android_environment(editor)?)
@@ -3471,21 +3229,6 @@ fn run_godot_export(
     let export_path = resolve_export_path(cwd, &preset.export_path);
     if let Some(parent) = export_path.parent() {
         fs::create_dir_all(parent)?;
-    }
-    let integrity_status_path = cwd
-        .join(".godot")
-        .join("pug")
-        .join("integrity_export_status.json");
-    if let Some(parent) = integrity_status_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if integrity_status_path.exists() {
-        fs::remove_file(&integrity_status_path).with_context(|| {
-            format!(
-                "remove stale integrity status file {}",
-                integrity_status_path.display()
-            )
-        })?;
     }
 
     let mut cmd = Command::new(editor);
@@ -3501,28 +3244,11 @@ fn run_godot_export(
         cmd.env("ANDROID_SDK_ROOT", &android_env.sdk);
         cmd.env("JAVA_HOME", &android_env.java_home);
     }
-    if remote_sign.no_remote_sign {
-        cmd.env("GODOT_CUSTOM_INTEGRITY_NO_REMOTE_SIGN", "1");
-    } else {
-        cmd.env("GODOT_CUSTOM_INTEGRITY_STATUS_PATH", &integrity_status_path);
-        if let Some(base_url) = &remote_sign.base_url {
-            cmd.env("PANNEL_BASE_URL", base_url);
-        }
-        if let Some(project_name) = &remote_sign.project_name {
-            cmd.env("GODOT_CUSTOM_INTEGRITY_PROJECT_NAME", project_name);
-        }
-        if let Some(editor_token) = &remote_sign.editor_token {
-            cmd.env("GODOT_CUSTOM_INTEGRITY_EDITOR_TOKEN", editor_token);
-        }
-    }
     let pug_pck_manifest_path = cwd.join(PUG_PCK_MANIFEST_WORK_PATH);
     if pug_pck_manifest_path.is_file() {
         cmd.env(PUG_PCK_MANIFEST_SOURCE_ENV, &pug_pck_manifest_path);
     }
     util::run_command(&mut cmd)?;
-    if !remote_sign.no_remote_sign {
-        validate_remote_sign_status(&integrity_status_path)?;
-    }
     println!("exported {} -> {}", preset.name, export_path.display());
     Ok(())
 }
@@ -3540,24 +3266,8 @@ fn export_pack_presets(
         .filter(|preset| preset.platform == preset_platform_name(platform_name).unwrap_or(""))
     {
         run_godot_pack_export(editor, cwd, project, preset)?;
-        if let Some(key) = random_pack_key(preset) {
-            let key_path = resolve_export_path(cwd, &preset.export_path).with_extension("pck.key");
-            fs::write(&key_path, format!("{key}\n"))
-                .with_context(|| format!("write {}", key_path.display()))?;
-            println!("wrote pack key {}", key_path.display());
-        }
     }
     Ok(())
-}
-
-fn random_pack_key(preset: &ExportPreset) -> Option<&str> {
-    match &preset.kind {
-        ExportPresetKind::Pack {
-            encrypt_type: ProjectPackEncryptType::Random,
-            ..
-        } => preset.credential_key.as_deref(),
-        _ => None,
-    }
 }
 
 fn run_godot_pack_export(
@@ -3578,26 +3288,6 @@ fn run_godot_pack_export(
         fs::create_dir_all(parent)?;
     }
     let files = pack_export_file_entries(cwd, pack_name, pack)?;
-    let key = preset
-        .credential_key
-        .as_deref()
-        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
-    let encrypt_files = preset.credential_key.is_some();
-    let encrypt_directory = match &preset.kind {
-        ExportPresetKind::Pack {
-            encrypt_type: ProjectPackEncryptType::None,
-            ..
-        } => false,
-        ExportPresetKind::Pack {
-            encrypt_type: ProjectPackEncryptType::Random,
-            ..
-        } => true,
-        ExportPresetKind::Pack {
-            encrypt_type: ProjectPackEncryptType::Project,
-            ..
-        } => export_encrypt_directory(project),
-        ExportPresetKind::App => false,
-    };
     let temp_dir = tempfile::Builder::new()
         .prefix("pug-pack-export-")
         .tempdir_in(cwd.join(".godot").join("pug"))
@@ -3610,9 +3300,6 @@ fn run_godot_pack_export(
         &manifest_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "output": export_path.to_string_lossy(),
-            "key": key,
-            "encrypt_files": encrypt_files,
-            "encrypt_directory": encrypt_directory,
             "files": files,
         }))?,
     )
@@ -3658,12 +3345,12 @@ func _init():
 		_fail("invalid pack manifest")
 		return
 	var packer := PCKPacker.new()
-	var err := packer.pck_start(manifest["output"], 32, manifest["key"], manifest["encrypt_directory"])
+	var err := packer.pck_start(manifest["output"], 32)
 	if err != OK:
 		_fail("pck_start failed: %s" % err)
 		return
 	for file in manifest["files"]:
-		err = packer.add_file(file["target"], file["source"], manifest["encrypt_files"])
+		err = packer.add_file(file["target"], file["source"])
 		if err != OK:
 			_fail("add_file failed for %s: %s" % [file["target"], err])
 			return
@@ -3677,32 +3364,6 @@ func _fail(message: String):
 	push_error(message)
 	quit(1)
 "#
-}
-
-#[derive(Debug, Deserialize)]
-struct IntegrityExportStatus {
-    status: String,
-    #[serde(default)]
-    message: String,
-}
-
-fn validate_remote_sign_status(path: &Path) -> Result<()> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read integrity export status {}", path.display()))?;
-    let status: IntegrityExportStatus = serde_json::from_str(&text)
-        .with_context(|| format!("parse integrity export status {}", path.display()))?;
-    match status.status.as_str() {
-        "signed" | "not_needed" => Ok(()),
-        "bypassed" => bail!(
-            "remote integrity signing was bypassed by the editor: {}",
-            status.message
-        ),
-        "failed" => bail!("remote integrity signing failed: {}", status.message),
-        other => bail!(
-            "remote integrity signing returned unexpected status {other}: {}",
-            status.message
-        ),
-    }
 }
 
 fn resolve_export_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -3721,10 +3382,9 @@ fn upload_export_artifact(
     platform_name: &str,
     mode: ExportMode,
     export_path: &Path,
-    no_remote_sign: bool,
 ) -> Result<()> {
     let (package_path, package_type, metadata) =
-        package_export_artifact(project, platform_name, mode, export_path, no_remote_sign)?;
+        package_export_artifact(project, platform_name, mode, export_path)?;
     let sha = util::sha256_file(&package_path)?;
     let size = util::file_size(&package_path)?;
     let repo_commit = git_head(cwd).unwrap_or_default();
@@ -3768,9 +3428,7 @@ fn upload_downloadable_packs(
         .filter(|preset| preset.is_pack_for(platform_name, ProjectPackKind::Downloadable))
     {
         let ExportPresetKind::Pack {
-            pack_name,
-            encrypt_type,
-            ..
+            pack_name, ..
         } = &preset.kind
         else {
             continue;
@@ -3806,8 +3464,6 @@ fn upload_downloadable_packs(
             package_size: size,
             engine_tag: &project.engine.tag,
             repo_commit: &repo_commit,
-            encrypt_type: encrypt_type.name(),
-            encryption_key: preset.credential_key.as_deref(),
             metadata,
         })?;
         api.put_file(&init, &package_path)?;
@@ -3829,13 +3485,7 @@ fn package_export_artifact(
     platform_name: &str,
     mode: ExportMode,
     export_path: &Path,
-    no_remote_sign: bool,
 ) -> Result<(PathBuf, &'static str, serde_json::Value)> {
-    let integrity_mode = if no_remote_sign {
-        "no_remote_sign"
-    } else {
-        "remote_sign"
-    };
     match platform_name {
         "android" => {
             if !export_path.is_file() {
@@ -3847,7 +3497,6 @@ fn package_export_artifact(
             let files = apk_native_library_metadata(export_path)?;
             let apk_signed = android_export_signed(project);
             let metadata = serde_json::json!({
-                "integrity_mode": integrity_mode,
                 "apk_signed": apk_signed,
                 "apk_signing": if apk_signed { "local" } else { "unsigned" },
                 "files": files,
@@ -3875,7 +3524,6 @@ fn package_export_artifact(
             util::zip_paths(&zip_path, dir, &[dir.to_path_buf()])?;
             let files = windows_binary_metadata(dir)?;
             let metadata = serde_json::json!({
-                "integrity_mode": integrity_mode,
                 "files": files,
             });
             Ok((zip_path, "zip", metadata))
@@ -4395,7 +4043,6 @@ mod tests {
             debug: false,
             release: true,
             upload: false,
-            no_remote_sign: false,
             with_engine: None,
         };
 
@@ -4572,8 +4219,6 @@ mod tests {
             export: Some(ProjectExportConfig {
                 name: Some("Demo".to_string()),
                 output_dir: Some(PathBuf::from("../build/demo_export")),
-                encrypt: Some(true),
-                script_encryption_key: Some("0123456789abcdef".to_string()),
                 ..Default::default()
             }),
             nuget: ProjectNugetConfig::default(),
@@ -4587,8 +4232,6 @@ mod tests {
             PathBuf::from("../build/demo_export/Android/Demo.apk")
         );
         assert!(text.contains("export_path=\"../build/demo_export/Android/Demo.apk\""));
-        assert!(text.contains("encrypt_pck=true"));
-        assert!(text.contains("encrypt_directory=true"));
         assert!(text.contains("architectures/arm64-v8a=true"));
         assert!(text.contains("version/name=\"1.0.0\""));
         assert!(text.contains("package/unique_name=\"com.example.demo\""));
@@ -4793,7 +4436,6 @@ mod tests {
                 kind: ProjectPackKind::Downloadable,
                 dist: None,
                 mount_path: None,
-                encrypt_type: ProjectPackEncryptType::Random,
             },
         );
         packs.insert(
@@ -4804,7 +4446,6 @@ mod tests {
                 kind: ProjectPackKind::Normal,
                 dist: Some(PathBuf::from("assets")),
                 mount_path: Some(PathBuf::from("Localization")),
-                encrypt_type: ProjectPackEncryptType::Project,
             },
         );
         let project = ProjectConfig {
@@ -4819,16 +4460,12 @@ mod tests {
             export: Some(ProjectExportConfig {
                 name: Some("Demo".to_string()),
                 output_dir: Some(PathBuf::from("../build/demo_export")),
-                encrypt: Some(true),
-                script_encryption_key: Some(
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-                ),
                 ..Default::default()
             }),
             nuget: ProjectNugetConfig::default(),
         };
 
-        let (text, presets) = render_export_presets(dir.path(), &project, None).unwrap();
+        let (text, _presets) = render_export_presets(dir.path(), &project, None).unwrap();
 
         assert!(text.contains("name=\"Pug Pack Android dl\""));
         assert!(text.contains("name=\"Pug Pack Android normal\""));
@@ -4847,12 +4484,6 @@ mod tests {
         assert!(text.contains(
             "exclude_filter=\"project*.pug.json,packs/dl/*,packs/dl/**,packs/normal/*,packs/normal/**\""
         ));
-
-        let random = presets
-            .iter()
-            .find(|preset| preset.name == "Pug Pack Android dl")
-            .unwrap();
-        assert_eq!(random.credential_key.as_ref().unwrap().len(), 64);
     }
 
     #[test]
@@ -4866,7 +4497,6 @@ mod tests {
                 kind: ProjectPackKind::Downloadable,
                 dist: None,
                 mount_path: None,
-                encrypt_type: ProjectPackEncryptType::Random,
             },
         );
         packs.insert(
@@ -4877,7 +4507,6 @@ mod tests {
                 kind: ProjectPackKind::Normal,
                 dist: Some(PathBuf::from("assets")),
                 mount_path: None,
-                encrypt_type: ProjectPackEncryptType::Project,
             },
         );
         let project = ProjectConfig {
@@ -4919,41 +4548,5 @@ mod tests {
                 path: "assets/normal.pck".to_string(),
             }]
         );
-    }
-
-    #[test]
-    fn rewrite_manifest_omits_integrity_hashes() {
-        let dir = tempfile::tempdir().unwrap();
-        let lib_dir = dir.path().join("bin/rust_demo/windows/x86_64");
-        fs::create_dir_all(&lib_dir).unwrap();
-        fs::write(lib_dir.join("rust_demo.dll"), "demo dll").unwrap();
-
-        let project = ProjectConfig {
-            name: "test_project".to_string(),
-            version: "1.0.0".to_string(),
-            engine: ProjectEngine {
-                tag: "test".to_string(),
-            },
-            platforms: test_platforms(&["windows"]),
-            extensions: BTreeMap::new(),
-            packs: BTreeMap::new(),
-            export: None,
-            nuget: ProjectNugetConfig::default(),
-        };
-
-        rewrite_manifest(
-            dir.path(),
-            "rust_demo",
-            &project,
-            "[configuration]\nentry_symbol = \"gdext_rust_init\"\n",
-        )
-        .unwrap();
-
-        let text = fs::read_to_string(dir.path().join("bin/rust_demo.gdextension")).unwrap();
-        assert!(text.contains("[libraries]\n"));
-        assert!(text.contains(
-            "windows.x86_64.release = \"res://bin/rust_demo/windows/x86_64/rust_demo.dll\""
-        ));
-        assert!(!text.contains("[integrity]\n"));
     }
 }

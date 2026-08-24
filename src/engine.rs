@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use inquire::{Confirm, Select};
 use rand::{Rng, distr::Alphanumeric};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -29,8 +28,8 @@ pub use artifacts::{git_head, git_worktree_dirty, godot_version, make_dev_key};
 use artifacts::{package_engine_artifacts, upload_engine_artifacts};
 use binaries::{choose_preferred_binary, find_matching_binary, matching_binaries};
 #[cfg(test)]
-use model::{ArchSection, TemplateTarget};
-use model::{BuildContext, BuiltArtifact, ProjectJson, editor_output_dir};
+use model::{ArchSection, ProjectJson, TemplateTarget};
+use model::{BuildContext, BuiltArtifact, editor_output_dir};
 pub use source::find_repo_root;
 use source::{
     apply_patches, find_repo_root_from, force_restore_godot_source, godot_tag, prepare_splash,
@@ -39,13 +38,11 @@ use source::{
 #[cfg(test)]
 use targets::default_template_arches;
 use targets::{grouped_template_archs, resolve_template_targets, validate_targets};
-#[cfg(test)]
-use toolchain::normalize_external_path;
-use toolchain::{ensure_android_swappy, find_scons, path_str, python_command};
+use toolchain::{
+    ensure_android_swappy, find_scons, normalize_external_path, path_str, python_command,
+};
 
 pub use toolchain::{android_ndk_host, android_sdk};
-
-const NO_LOG_CPPDEFINE: &str = "GODOT_CUSTOM_NO_LOG";
 
 pub struct EngineBuildOptions {
     pub upload: bool,
@@ -54,8 +51,6 @@ pub struct EngineBuildOptions {
     pub godot_source: Option<PathBuf>,
     pub skip_patches: bool,
     pub no_restore: bool,
-    pub no_log: bool,
-    pub no_remote_sign: bool,
     pub force: bool,
     pub scons_args: Vec<String>,
 }
@@ -65,10 +60,7 @@ pub fn build(opts: EngineBuildOptions) -> Result<()> {
         Config::load()?.verify_access_token()?;
     }
 
-    let mut ctx = prepare_context(&opts)?;
-    if opts.no_log {
-        add_cppdefine(&mut ctx.scons_args, NO_LOG_CPPDEFINE);
-    }
+    let ctx = prepare_context(&opts)?;
     validate_targets(&ctx)?;
 
     eprintln!("pug: restoring Godot source at {}", ctx.godot_src.display());
@@ -495,8 +487,6 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
     let host_godot = platform::host_godot_platform()?;
     let host_arch = platform::host_arch();
     let template_targets = resolve_template_targets(&project, opts.template_platforms.as_deref())?;
-    let manifest_public_key_path =
-        prepare_manifest_public_key(&repo_root, &project, opts.upload, opts.no_remote_sign)?;
     Ok(BuildContext {
         repo_root,
         godot_src,
@@ -506,114 +496,7 @@ fn prepare_context(opts: &EngineBuildOptions) -> Result<BuildContext> {
         host_arch,
         template_targets,
         scons_args: opts.scons_args.clone(),
-        manifest_public_key_path,
     })
-}
-
-fn prepare_manifest_public_key(
-    repo_root: &Path,
-    project: &ProjectJson,
-    upload: bool,
-    no_remote_sign: bool,
-) -> Result<Option<PathBuf>> {
-    if !integrity_signing_enabled(project) {
-        return Ok(None);
-    }
-    if no_remote_sign {
-        eprintln!(
-            "warning: --no-remote-sign set; engine build will not embed pannel manifest public key"
-        );
-        return Ok(None);
-    }
-
-    let project_name = resolve_build_project_name(project)?;
-    let cfg = Config::load()?;
-    let api = ApiClient::from_config(&cfg)?;
-    let response = match api.manifest_public_key(&project_name) {
-        Ok(response) => response,
-        Err(err) if !upload => {
-            eprintln!(
-                "warning: failed to fetch pannel manifest public key for project {project_name}; continuing unsigned because this build is not uploading: {err}"
-            );
-            return Ok(None);
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!("fetch manifest public key for pannel project {project_name}")
-            });
-        }
-    };
-    let public_key_pem = normalize_pem(&response.manifest_public_key_pem);
-    if public_key_pem.is_empty() {
-        bail!("pannel project {project_name} does not have a manifest public key configured");
-    }
-    let public_key_sha256 = sha256_hex(public_key_pem.as_bytes());
-    if !response.manifest_public_key_sha256.trim().is_empty()
-        && response.manifest_public_key_sha256 != public_key_sha256
-    {
-        bail!(
-            "pannel project {project_name} manifest public key hash mismatch: got {public_key_sha256} want {}",
-            response.manifest_public_key_sha256
-        );
-    }
-
-    let path = repo_root.join(".cache/pug/integrity/manifest_public.pem");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(&path, public_key_pem).with_context(|| format!("write {}", path.display()))?;
-    eprintln!(
-        "pug: embedding pannel manifest public key project={} sha256={} path={}",
-        project_name,
-        public_key_sha256,
-        path.display()
-    );
-    Ok(Some(path))
-}
-
-fn integrity_signing_enabled(project: &ProjectJson) -> bool {
-    let Some(signing) = &project.signing else {
-        return false;
-    };
-    if let Some(enabled) = signing.enabled {
-        return enabled;
-    }
-    signing
-        .manifest_public_key_path
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-}
-
-fn resolve_build_project_name(project: &ProjectJson) -> Result<String> {
-    if let Ok(name) = std::env::var("PANNEL_PROJECT_NAME")
-        && !name.trim().is_empty()
-    {
-        return Ok(name.trim().to_string());
-    }
-    project
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .context("project name is required; set project.json name or PANNEL_PROJECT_NAME")
-}
-
-fn normalize_pem(value: &str) -> String {
-    let value = value.replace("\\n", "\n");
-    let value = value.trim();
-    if value.is_empty() {
-        String::new()
-    } else {
-        format!("{value}\n")
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn build_editor(ctx: &BuildContext) -> Result<()> {
@@ -846,23 +729,6 @@ fn run_scons(
             if enabled { "yes" } else { "no" }
         ));
     }
-    if let Some(key) = ctx
-        .project
-        .encryption
-        .as_ref()
-        .and_then(|e| e.key.as_deref())
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-    {
-        cmd.env("SCRIPT_AES256_ENCRYPTION_KEY", key);
-    }
-    if let Some(path) = &ctx.manifest_public_key_path {
-        cmd.arg(format!(
-            "godot_custom_manifest_public_key_path={}",
-            path_str(path)
-        ));
-        cmd.env("GODOT_CUSTOM_INTEGRITY_MANIFEST_PUBLIC_KEY_PATH", path);
-    }
     cmd.args(&ctx.scons_args)
         .arg(format!(
             "-j{}",
@@ -1079,43 +945,20 @@ fn project_name_in_dir(dir: &Path) -> Result<Option<String>> {
 
 fn existing_file(path: &Path) -> Result<PathBuf> {
     if path.is_file() {
-        path.canonicalize()
-            .with_context(|| format!("resolve {}", path.display()))
+        let resolved = path
+            .canonicalize()
+            .with_context(|| format!("resolve {}", path.display()))?;
+        // Windows stores a `\\?\` verbatim prefix on canonicalize() output;
+        // NuGet cannot parse that form as a local package source, so strip it.
+        Ok(normalize_external_path(resolved))
     } else {
         bail!("file does not exist: {}", path.display())
-    }
-}
-
-fn add_cppdefine(args: &mut Vec<String>, define: &str) {
-    let mut found = false;
-    for arg in args.iter_mut() {
-        if let Some(rest) = arg.strip_prefix("cppdefines=") {
-            found = true;
-            if !rest.split_whitespace().any(|v| v == define) {
-                arg.push(' ');
-                arg.push_str(define);
-            }
-        }
-    }
-    if !found {
-        args.push(format!("cppdefines={define}"));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn add_cppdefine_appends_once() {
-        let mut args = vec![
-            "debug_symbols=yes".to_string(),
-            "cppdefines=FOO".to_string(),
-        ];
-        add_cppdefine(&mut args, "BAR");
-        add_cppdefine(&mut args, "BAR");
-        assert_eq!(args[1], "cppdefines=FOO BAR");
-    }
 
     #[test]
     fn parse_godot_version_file() {

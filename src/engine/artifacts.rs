@@ -407,7 +407,6 @@ mod tests {
             host_arch: "x86_64",
             template_targets: Vec::new(),
             scons_args: Vec::new(),
-            manifest_public_key_path: None,
         };
 
         let artifacts = package_engine_artifacts(&ctx).unwrap();
@@ -466,7 +465,6 @@ mod tests {
                 arch: "x86_64".to_string(),
             }],
             scons_args: Vec::new(),
-            manifest_public_key_path: None,
         };
 
         let artifacts = package_engine_artifacts(&ctx).unwrap();
@@ -516,7 +514,6 @@ mod tests {
                 arch: "arm64".to_string(),
             }],
             scons_args: Vec::new(),
-            manifest_public_key_path: None,
         };
 
         let artifacts = package_engine_artifacts(&ctx).unwrap();

@@ -1,9 +1,18 @@
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::config::Config;
+
+// Larger timeouts so large engine artifacts (e.g. the editor zip) can be
+// uploaded to object storage over slower links without a dropped connection.
+fn build_client() -> Result<Client> {
+    Ok(Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(600))
+        .build()?)
+}
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -229,25 +238,7 @@ pub struct DownloadablePackageUploadInit<'a> {
     pub package_size: i64,
     pub engine_tag: &'a str,
     pub repo_commit: &'a str,
-    pub encrypt_type: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encryption_key: Option<&'a str>,
     pub metadata: serde_json::Value,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct EditorTokenResponse {
-    pub editor_token: String,
-    pub expires_at: i64,
-    pub scope: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ManifestPublicKeyResponse {
-    pub manifest_public_key_pem: String,
-    pub manifest_public_key_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -260,7 +251,7 @@ impl ApiClient {
         Ok(Self {
             base_url: cfg.base_url().trim_end_matches('/').to_string(),
             access_token: cfg.access_token(),
-            client: Client::builder().build()?,
+            client: build_client()?,
         })
     }
 
@@ -268,7 +259,7 @@ impl ApiClient {
         Ok(Self {
             base_url: cfg.base_url().trim_end_matches('/').to_string(),
             access_token: Some(access_token),
-            client: Client::builder().build()?,
+            client: build_client()?,
         })
     }
 
@@ -306,20 +297,6 @@ impl ApiClient {
             "/cli-api/v1/extensions/upload/complete",
             &CompleteUpload { upload_id },
         )
-    }
-
-    pub fn editor_token(&self, project: &str) -> Result<EditorTokenResponse> {
-        self.authenticated_post_json(
-            &format!("/cli-api/v1/projects/{}/editor-token", url_escape(project)),
-            &serde_json::json!({}),
-        )
-    }
-
-    pub fn manifest_public_key(&self, project: &str) -> Result<ManifestPublicKeyResponse> {
-        self.authenticated_get_json(&format!(
-            "/cli-api/v1/projects/{}/manifest-public-key",
-            url_escape(project)
-        ))
     }
 
     pub fn export_upload_init(&self, req: &ExportUploadInit<'_>) -> Result<UploadInitResponse> {

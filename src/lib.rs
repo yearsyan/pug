@@ -70,10 +70,6 @@ struct EngineBuildArgs {
     #[arg(long)]
     no_restore: bool,
     #[arg(long)]
-    no_log: bool,
-    #[arg(long)]
-    no_remote_sign: bool,
-    #[arg(long)]
     force: bool,
     #[arg(last = true)]
     scons_args: Vec<String>,
@@ -207,8 +203,6 @@ struct ProjectPackAddArgs {
     id: Option<String>,
     #[arg(long)]
     mount_path: Option<PathBuf>,
-    #[arg(long, default_value = "project", value_parser = ["project", "none", "random"])]
-    encrypt_type: String,
 }
 
 #[derive(Args, Debug)]
@@ -231,8 +225,6 @@ struct ProjectExportArgs {
     #[arg(long)]
     upload: bool,
     #[arg(long)]
-    no_remote_sign: bool,
-    #[arg(long)]
     with_engine: Option<PathBuf>,
 }
 
@@ -247,8 +239,6 @@ pub fn run() -> Result<()> {
                 godot_source: args.godot_source,
                 skip_patches: args.skip_patches,
                 no_restore: args.no_restore,
-                no_log: args.no_log,
-                no_remote_sign: args.no_remote_sign,
                 force: args.force,
                 scons_args: args.scons_args,
             }),
@@ -295,7 +285,6 @@ pub fn run() -> Result<()> {
                     args.normal || args.internal,
                     args.id.as_deref(),
                     args.mount_path.as_deref(),
-                    &args.encrypt_type,
                 ),
             },
             ProjectCommands::Export(args) => {
@@ -306,7 +295,6 @@ pub fn run() -> Result<()> {
                     debug: args.debug,
                     release: args.release,
                     upload: args.upload,
-                    no_remote_sign: args.no_remote_sign,
                     with_engine: args.with_engine,
                 })
             }
