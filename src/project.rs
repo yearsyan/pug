@@ -3041,7 +3041,7 @@ fn rewrite_manifest_for_platforms(
     for platform_name in platforms {
         for arch in extension_arches_for_platform(project, platform_name)? {
             let target = platform::spec(platform_name, &arch)?;
-            let lib = find_installed_lib(cwd, name, &target.platform, &target.arch)?;
+            let lib = find_installed_lib(cwd, name, &target)?;
             let rel = format!(
                 "res://bin/{}/{}/{}/{}",
                 name,
@@ -3062,21 +3062,21 @@ fn rewrite_manifest_for_platforms(
     Ok(())
 }
 
-fn find_installed_lib(cwd: &Path, name: &str, platform: &str, arch: &str) -> Result<PathBuf> {
-    let dir = cwd.join("bin").join(name).join(platform).join(arch);
-    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.ends_with(".so")
-                || file_name.ends_with(".dylib")
-                || file_name.ends_with(".dll")
-            {
-                return Ok(entry.path());
-            }
-        }
+fn find_installed_lib(cwd: &Path, name: &str, target: &platform::TargetSpec) -> Result<PathBuf> {
+    let dir = cwd
+        .join("bin")
+        .join(name)
+        .join(&target.platform)
+        .join(&target.arch);
+    let expected = dir.join(target.lib_name(name));
+    if expected.is_file() {
+        return Ok(expected);
     }
-    bail!("no installed library in {}", dir.display())
+    bail!(
+        "installed extension library {} not found in {}",
+        expected.file_name().unwrap().to_string_lossy(),
+        dir.display()
+    )
 }
 
 fn strip_libraries(text: &str) -> String {
@@ -4176,6 +4176,34 @@ mod tests {
     fn strips_existing_libraries() {
         let text = "[configuration]\na = 1\n[libraries]\nmacos.debug = \"x\"\n";
         assert!(!strip_libraries(text).contains("macos.debug"));
+    }
+
+    #[test]
+    fn installed_library_ignores_sidecar_dlls() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = platform::spec("windows", "x86_64").unwrap();
+        let bin_dir = dir.path().join("bin/game_stream/windows/x86_64");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("avcodec-63.dll"), []).unwrap();
+        fs::write(bin_dir.join("avutil-61.dll"), []).unwrap();
+        fs::write(bin_dir.join("game_stream.dll"), []).unwrap();
+
+        assert_eq!(
+            find_installed_lib(dir.path(), "game_stream", &target).unwrap(),
+            bin_dir.join("game_stream.dll")
+        );
+    }
+
+    #[test]
+    fn installed_library_requires_exact_extension_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = platform::spec("windows", "x86_64").unwrap();
+        let bin_dir = dir.path().join("bin/game_stream/windows/x86_64");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("avcodec-63.dll"), []).unwrap();
+
+        let err = find_installed_lib(dir.path(), "game_stream", &target).unwrap_err();
+        assert!(err.to_string().contains("game_stream.dll not found"));
     }
 
     #[test]
